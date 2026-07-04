@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+# Lattice Compiler & Execution CLI Launcher
+
+if [ -z "$1" ]; then
+    echo "Usage: lattice <source_file.lattice> [args...]"
+    exit 1
+fi
+
+# Resolve directories relative to this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 1. Compile source to WASM
+# We use a temporary wasm file inside the workspace
+WASM_TEMP="$SCRIPT_DIR/temp_compilation_output.wasm"
+
+python3 "$SCRIPT_DIR/compiler/main.py" "$1" "$WASM_TEMP"
+COMPILE_STATUS=$?
+
+if [ $COMPILE_STATUS -ne 0 ]; then
+    exit $COMPILE_STATUS
+fi
+
+# 2. Run the compiled WASM
+node "$SCRIPT_DIR/run_wasm.js" "$WASM_TEMP" "${@:2}"
+EXEC_STATUS=$?
+
+exit $EXEC_STATUS

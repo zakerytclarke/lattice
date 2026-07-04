@@ -1,0 +1,13 @@
+// Lattice Unbounded Recursion (fails termination check)
+
+function bad_recursion(n: Integer(x){x > 0}) -> Integer {
+    if (n <= 1) {
+        return 1;
+    } else {
+        return n * bad_recursion(n); // Forgets to subtract 1!
+    }
+}
+
+external function main(n: Integer(x){x > 0}) -> Integer {
+    return bad_recursion(n);
+}

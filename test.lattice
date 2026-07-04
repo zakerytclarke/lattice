@@ -1,0 +1,41 @@
+// Lattice Compiler Test Case
+
+// 1. Rational arithmetic
+function test_rational() -> Integer {
+    const r1 = Rational(1, 2);
+    const r2 = Rational(1, 4);
+    const r3 = add(r1, r2); // Returns Rational(6, 8)
+    return r3.Numerator + r3.Denominator; // 6 + 8 = 14
+}
+
+// 2. Loops and array bounds
+function test_loops() -> Integer {
+    const arr = [10, 20, 30, 40, 50]; // Inferred as List[5, Integer]
+    let sum = 0;
+    for i in 0..5 {
+        // SMT verifier checks index range 0 <= i < 5
+        sum = sum + arr.data[i];
+    }
+    return sum; // 150
+}
+
+// 3. Tail recursion termination proof
+function sum_rec(n: Integer, acc: Integer) -> Integer {
+    if (n <= 0) {
+        return acc;
+    }
+    // Verifier checks this is a tail call (directly returned)
+    return sum_rec(n - 1, acc + n);
+}
+
+// 4. External entrypoint for execution
+external function main(n: Integer) -> Integer {
+    const r_sum = test_rational();
+    const l_sum = test_loops();
+    const rec_sum = sum_rec(n, 0);
+    
+    // Call import function to print
+    print_int(l_sum); // prints 150
+    
+    return r_sum + rec_sum;
+}
