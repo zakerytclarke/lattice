@@ -150,15 +150,28 @@
             },
             http_get_raw: function(url_ptr, url_len, out_ptr, max_len) {
                 const view = new DataView(exports.memory.buffer);
+                const mem = new Uint8Array(exports.memory.buffer);
+                const memorySize = mem.length;
+                if (url_ptr < 0 || url_ptr + 8 > memorySize || url_len < 0 || url_len > 4096) {
+                    mem[out_ptr] = 1;
+                    return;
+                }
                 const list_ptr = view.getInt32(url_ptr + 4, true);
+                if (list_ptr < 0 || list_ptr + 4 > memorySize) {
+                    mem[out_ptr] = 1;
+                    return;
+                }
                 const char_data_ptr = view.getInt32(list_ptr, true);
+                if (char_data_ptr < 0 || char_data_ptr + url_len * 4 > memorySize) {
+                    mem[out_ptr] = 1;
+                    return;
+                }
                 let url = "";
                 for (let i = 0; i < url_len; i++) {
                     url += String.fromCodePoint(view.getInt32(char_data_ptr + i * 4, true));
                 }
-                const mem = new Uint8Array(exports.memory.buffer);
                 try {
-                    const content = cp.execSync(`curl -s "${url}"`, { encoding: 'utf8', timeout: 5000 });
+                    const content = cp.execFileSync('curl', ['-s', '--max-time', '5', url], { encoding: 'utf8' });
                     const finalLen = Math.min(content.length, max_len);
                     
                     // Write Union tag (Some = 0)

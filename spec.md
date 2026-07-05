@@ -320,6 +320,8 @@ The standard library is embedded in `compiler/stdlib.py` and loaded automaticall
 
 The compiler rejects programs it cannot prove safe. The test suite in `tests/tests.json` documents expected behavior.
 
+Verification is **fail-closed**: if the SMT solver cannot translate or prove a required constraint, compilation fails rather than silently assuming safety.
+
 ### 10.1 Index bounds
 
 List and string indexing requires a proof that `0 <= index < length`. Unguarded out-of-bounds access fails (see `tests/list_unsafe.lattice`, `tests/string_unsafe.lattice`).
@@ -343,6 +345,26 @@ All union variants must be handled (see `tests/option_unsafe.lattice`).
 ### 10.6 Module boundaries
 
 Importing non-external symbols fails. Redefining stdlib symbols fails.
+
+### 10.7 Type checking and generics
+
+- Function calls are checked for arity and structural type compatibility
+- Generic size parameters must be inferable at call sites; silent fallback values are not used during verification
+- `const` variables cannot be reassigned
+- Union `match` exhaustiveness uses variant base names (`Some` matches `Some_Integer`)
+
+### 10.8 Standard library verification
+
+The embedded standard library is resolved and SMT-verified at compiler startup. IO wrappers (`read_file`, `http_get`) include preconditions that `url.len` / `path.len` stay within declared capacity.
+
+### 10.9 Compiler diagnostics
+
+Errors include a short `hint:` line when the compiler can suggest a fix:
+
+- **Type mismatches** show expected and actual types using readable names (`String[20]`, `List[5, Integer]`)
+- **Generic inference failures** name the callee and suggest explicit instantiation (e.g. `read_file[1024, 256](path)`)
+- **Static size errors** explain that Lattice has no heap — capacities must appear in types or generic arguments
+- **Safety failures** show the constraint that could not be proved (e.g. `idx >= 0 && idx < N`) and how to guard it
 
 ---
 

@@ -7,8 +7,9 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from compiler.parser import parse_code, Literal, Identifier, BinaryExpr, FieldExpr, ImportDecl, FuncDecl, TypeDecl, UnionTypeDecl
-from compiler.resolver import Resolver, LatticeTypeError
-from compiler.verifier import SMTVerifier, SafetyError
+from compiler.errors import LatticeTypeError, SafetyError, format_compilation_error
+from compiler.resolver import Resolver
+from compiler.verifier import SMTVerifier
 from compiler.emitter import WASMEmitter
 from compiler.stdlib import STDLIB_CODE
 
@@ -23,13 +24,21 @@ stdlib_resolver = Resolver()
 try:
     stdlib_resolver.resolve_program(stdlib_ast)
 except LatticeTypeError as e:
-    print(f"Standard Library Type Error: {e}")
+    print(format_compilation_error(e, "stdlib"))
     sys.exit(1)
 
 # Resolve standard library function bodies
 for name, decl in stdlib_resolver.functions.items():
     if decl.kind in ['normal', 'server', 'external']:
         stdlib_resolver.resolve_func_body(decl)
+
+# Verify standard library safety at compiler startup
+try:
+    stdlib_verifier = SMTVerifier(stdlib_resolver)
+    stdlib_verifier.verify_program_safety(stdlib_ast)
+except SafetyError as e:
+    print(format_compilation_error(e, "stdlib"))
+    sys.exit(1)
 
 
 class ModuleLoader:
@@ -135,15 +144,19 @@ class ModuleLoader:
                     if not found:
                         raise LatticeTypeError(f"Symbol '{sym}' not found or not declared external in module '{imp.module_name}'", imp.line)
                         
-        # Resolve the module program
-        resolver.resolve_program(ast)
-        
+        try:
+            resolver.resolve_program(ast)
+        except LatticeTypeError as e:
+            e.file_name = os.path.basename(abs_path)
+            raise
+
         # Verify safety using Z3
         verifier = SMTVerifier(resolver)
         try:
             verifier.verify_program_safety(ast)
         except SafetyError as e:
-            raise SafetyError(f"In {os.path.basename(abs_path)}: {e}")
+            e.file_name = os.path.basename(abs_path)
+            raise
             
         self.modules[abs_path] = (ast, resolver)
         return ast, resolver
@@ -177,7 +190,8 @@ def main():
     try:
         main_ast, main_resolver = loader.load_module(source_path)
     except (SyntaxError, LatticeTypeError, SafetyError) as e:
-        print(f"Compilation Error: {e}")
+        file_name = getattr(e, 'file_name', None) or os.path.basename(source_path)
+        print(format_compilation_error(e, file_name))
         sys.exit(1)
     except FileNotFoundError as e:
         print(f"Error: {e}")

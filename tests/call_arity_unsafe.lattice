@@ -1,0 +1,7 @@
+function add_two(a: Integer, b: Integer) -> Integer {
+    return a + b;
+}
+
+external function main() {
+    return add_two(1);
+}

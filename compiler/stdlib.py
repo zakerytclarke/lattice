@@ -93,12 +93,16 @@ function read_string[MaxLen: Integer]() -> IO[Input[String[MaxLen]]] {
 }
 
 function read_file[MaxLen: Integer, PathLen: Integer](path: String[PathLen]) -> IO[Input[String[MaxLen]]] {
+    path.len >= 0 && path.len <= PathLen;
+} {
     let result: Input[String[MaxLen]] = None();
     read_file_raw(path, path.len, result, MaxLen);
     return result;
 }
 
 function http_get[MaxLen: Integer, UrlLen: Integer](url: String[UrlLen]) -> IO[Input[String[MaxLen]]] {
+    url.len >= 0 && url.len <= UrlLen;
+} {
     let result: Input[String[MaxLen]] = None();
     http_get_raw(url, url.len, result, MaxLen);
     return result;

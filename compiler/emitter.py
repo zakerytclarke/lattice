@@ -44,6 +44,10 @@ def encode_vector(elements):
 TYPE_I32 = b'\x7f'
 TYPE_VOID = b'\x40'
 
+# Placeholder for unresolved size generics during WASM codegen. Verification uses
+# strict inference; per-call-site monomorphization is not yet implemented in the emitter.
+EMITTER_GENERIC_PLACEHOLDER = 100
+
 # ============================================================================
 # Code Emitter Class
 # ============================================================================
@@ -69,6 +73,7 @@ class WASMEmitter:
         # Export memory to JS
         self.export_section.append(encode_string("memory") + b'\x02\x00')
         
+        # Emitter-only placeholder for unresolved size generics.
         # 1. Setup external imports dynamically
         for name, decl in self.resolver.functions.items():
             is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
@@ -83,8 +88,12 @@ class WASMEmitter:
                             if gtype_name == 'Type':
                                 temp_generic_map[gname] = self.resolver.types['Integer']
                             else:
-                                temp_generic_map[gname] = 100
-                    ret_t = self.resolver.resolve_type_expr(decl.ret_type, temp_generic_map)
+                                temp_generic_map[gname] = EMITTER_GENERIC_PLACEHOLDER
+                    ret_t = None
+                    try:
+                        ret_t = self.resolver.resolve_type_expr(decl.ret_type, temp_generic_map)
+                    except LatticeTypeError:
+                        pass
                     if isinstance(ret_t, IOResolvedType):
                         ret_t = ret_t.inner
                     if ret_t and not (isinstance(ret_t, PrimitiveResolvedType) and ret_t.name == 'void'):
@@ -107,8 +116,12 @@ class WASMEmitter:
                         if gtype_name == 'Type':
                             temp_generic_map[gname] = self.resolver.types['Integer']
                         else:
-                            temp_generic_map[gname] = 100
-                ret_t = self.resolver.resolve_type_expr(decl.ret_type, temp_generic_map)
+                            temp_generic_map[gname] = EMITTER_GENERIC_PLACEHOLDER
+                ret_t = None
+                try:
+                    ret_t = self.resolver.resolve_type_expr(decl.ret_type, temp_generic_map)
+                except LatticeTypeError:
+                    pass
                 if isinstance(ret_t, IOResolvedType):
                     ret_t = ret_t.inner
                 if ret_t and not (isinstance(ret_t, PrimitiveResolvedType) and ret_t.name == 'void'):
@@ -160,7 +173,7 @@ class WASMEmitter:
                 if gtype_name == 'Type':
                     local_generic_map[gname] = self.resolver.types['Integer']
                 else:
-                    local_generic_map[gname] = 100
+                    local_generic_map[gname] = EMITTER_GENERIC_PLACEHOLDER
         self.resolver.current_generic_map = local_generic_map
 
         # Parameters occupy local indices starting from 0
@@ -434,7 +447,6 @@ class WASMEmitter:
                     code.append(0x41) # i32.const
                     code.extend(encode_sleb128(val))
                     return code
-            # Check local index
             if expr.name in self.wasm_locals:
                 l_idx = self.wasm_locals[expr.name]
                 code.append(0x20) # local.get
@@ -526,16 +538,7 @@ class WASMEmitter:
                                 
                 union_size = 0
                 if variant_tag != -1:
-                    union_te = TypeExpr(
-                        union_decl.name, 
-                        [self.resolver.resolved_to_type_expr(v, expr.line) for v in getattr(struct_t, 'generic_map', {}).values()], 
-                        expr.line
-                    )
-                    union_t = self.resolver.resolve_type_expr(union_te)
-                    if union_t:
-                        union_size = union_t.get_size(self.resolver)
-                    else:
-                        union_size = 1 + struct_t.get_size(self.resolver)
+                    union_size = 1 + struct_t.get_size(self.resolver)
                         
                 addr = self.data_offset
                 if union_size > 0:

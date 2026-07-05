@@ -1,0 +1,7 @@
+function foo[N: Integer, T: Type]() -> Integer {
+    return 0;
+}
+
+external function main() {
+    return foo();
+}

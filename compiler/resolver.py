@@ -2,11 +2,16 @@
 
 import sys
 from compiler.parser import *
-
-class LatticeTypeError(Exception):
-    def __init__(self, msg, line):
-        super().__init__(f"Type Error at line {line}: {msg}")
-        self.line = line
+from compiler.errors import (
+    LatticeTypeError,
+    format_expr,
+    format_type,
+    format_type_expr,
+    generic_inference_hint,
+    static_memory_hint,
+    type_mismatch_hint,
+    type_mismatch_message,
+)
 
 def clone_ast_node(node):
     if node is None:
@@ -83,7 +88,8 @@ class ListResolvedType(ResolvedType):
     def __repr__(self):
         return f"List[{self.length}, {self.elem_type}]"
     def get_size(self, resolver):
-        return self.length * self.elem_type.get_size(resolver)
+        length = self.length if self.length is not None else 0
+        return length * self.elem_type.get_size(resolver)
 
 class StringResolvedType(ResolvedType):
     def __init__(self, max_len):
@@ -123,14 +129,24 @@ class Resolver:
         self.globals = {} # name -> (ResolvedType, offset)
         self.global_offset = 1024 # start allocating static globals after offset 1024 (reserve bottom for stack / initial stuff)
         self.current_generic_map = {}
+        self.current_func = None
+        self._checking_call = None
         
         # Local environments
         self.locals = {} # name -> (ResolvedType, offset)
+        self.const_locals = set()
         self.local_offset = 0
         self.max_local_offset = 0
 
     def register_type(self, name, resolved_type):
         self.types[name] = resolved_type
+
+    def _current_callee_name(self):
+        if self._checking_call:
+            return self._checking_call
+        if self.current_func:
+            return self.current_func.name
+        return "<unknown>"
 
     def resolve_type_expr(self, te, generic_map=None):
         generic_map = generic_map or self.current_generic_map
@@ -160,19 +176,36 @@ class Resolver:
             if len(te.args) != 2:
                 raise LatticeTypeError("List type requires 2 arguments: List[Len, Elem]", te.line)
             
-            # Resolve length
+            # Resolve length — allow unresolved generic size parameters during body resolution
             len_arg = te.args[0]
-            length = self.evaluate_constant(len_arg, generic_map)
+            try:
+                length = self.evaluate_constant(len_arg, generic_map)
+            except LatticeTypeError:
+                if isinstance(len_arg, TypeExpr) and len_arg.name in generic_map:
+                    length = 0 if generic_map[len_arg.name] is not None else None
+                else:
+                    raise
             
             # Resolve element type
             elem_type = self.resolve_type_expr(te.args[1], generic_map)
+            if elem_type is None:
+                elem_type = self.types['Integer']
             return ListResolvedType(length, elem_type)
 
         if name == 'Group':
             if len(te.args) != 2:
                 raise LatticeTypeError("Group type requires 2 arguments", te.line)
-            length = self.evaluate_constant(te.args[0], generic_map)
+            len_arg = te.args[0]
+            try:
+                length = self.evaluate_constant(len_arg, generic_map)
+            except LatticeTypeError:
+                if isinstance(len_arg, TypeExpr) and len_arg.name in generic_map:
+                    length = 0 if generic_map[len_arg.name] is not None else None
+                else:
+                    raise
             elem_type = self.resolve_type_expr(te.args[1], generic_map)
+            if elem_type is None:
+                elem_type = self.types['Integer']
             return ListResolvedType(length, elem_type)
 
 
@@ -206,7 +239,17 @@ class Resolver:
                 for gname, _ in decl.generics:
                     val = local_generic_map.get(gname)
                     if val is None:
-                        val = self.types.get('Integer')
+                        if (
+                            gname in self.current_generic_map
+                            and self.current_generic_map[gname] is None
+                        ):
+                            arg_names.append(gname)
+                            continue
+                        raise LatticeTypeError(
+                            f"Cannot infer generic parameter '{gname}' for type '{name}'",
+                            te.line,
+                            hint=generic_inference_hint(name, decl.generics, local_generic_map),
+                        )
                     arg_names.append(str(val))
                 mono_name = f"{name}_{'_'.join(arg_names)}"
                 
@@ -236,7 +279,11 @@ class Resolver:
         if name in self.types:
             return self.types[name]
 
-        raise LatticeTypeError(f"Undefined type '{name}'", te.line)
+        raise LatticeTypeError(
+            f"Unknown type '{name}'",
+            te.line,
+            hint="Check spelling, imports, or provide explicit type parameters (e.g. List[5, Integer]).",
+        )
 
     def evaluate_constant(self, expr, generic_map=None):
         generic_map = generic_map or self.current_generic_map
@@ -247,12 +294,242 @@ class Resolver:
                 val = generic_map[expr.name]
                 if isinstance(val, int):
                     return val
-            raise LatticeTypeError(f"Unbounded generic constant '{expr.name}' at compile-time", expr.line)
+            raise LatticeTypeError(
+                f"Unbounded size parameter '{expr.name}' — compile-time constant required for static memory layout",
+                expr.line,
+                hint=static_memory_hint(),
+            )
         if isinstance(expr, TypeExpr):
-            # Check if it was resolved to a number in generics
             if expr.name in generic_map:
-                return generic_map[expr.name]
-        raise LatticeTypeError("Expected compile-time integer constant", expr.line)
+                val = generic_map[expr.name]
+                if isinstance(val, int):
+                    return val
+                if val is None and expr.name in self.current_generic_map:
+                    return 0
+        raise LatticeTypeError(
+            f"Expected a compile-time integer constant, got {format_expr(expr)}",
+            expr.line,
+            hint=static_memory_hint(),
+        )
+
+    def finalize_generic_map(self, generic_map, generic_decls, line, callee_name=None, allow_function_generics=False):
+        callee_name = callee_name or self._current_callee_name()
+        for gname, gtype_expr in generic_decls:
+            if generic_map.get(gname) is not None:
+                val = generic_map[gname]
+                gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
+                if gtype_name != 'Type' and isinstance(val, int) and val < 0:
+                    raise LatticeTypeError(
+                        f"Generic size parameter '{gname}' must be non-negative, got {val}",
+                        line,
+                    )
+                continue
+            if (
+                allow_function_generics
+                and gname in self.current_generic_map
+                and self.current_generic_map[gname] is None
+            ):
+                continue
+            raise LatticeTypeError(
+                f"Cannot infer generic parameter '{gname}' for '{callee_name}'",
+                line,
+                hint=generic_inference_hint(callee_name, generic_decls, generic_map),
+            )
+        return generic_map
+
+    def types_compatible(self, expected, actual, line):
+        if expected is None or actual is None:
+            return
+
+        if isinstance(expected, IOResolvedType):
+            return self.types_compatible(expected.inner, actual, line)
+        if isinstance(actual, IOResolvedType):
+            return self.types_compatible(expected, actual.inner, line)
+
+        if isinstance(actual, RefinedResolvedType):
+            actual = actual.base_type
+        if isinstance(expected, RefinedResolvedType):
+            expected = expected.base_type
+
+        if isinstance(expected, PrimitiveResolvedType) and isinstance(actual, PrimitiveResolvedType):
+            if expected.name != actual.name:
+                raise LatticeTypeError(
+                    type_mismatch_message(expected, actual, "Incompatible primitive types"),
+                    line,
+                    hint=type_mismatch_hint(expected, actual),
+                )
+            return
+
+        if isinstance(expected, ListResolvedType) and isinstance(actual, ListResolvedType):
+            if expected.length != actual.length:
+                raise LatticeTypeError(
+                    f"List capacity mismatch: expected {expected.length} elements, got {actual.length}",
+                    line,
+                    hint=type_mismatch_hint(expected, actual),
+                )
+            self.types_compatible(expected.elem_type, actual.elem_type, line)
+            return
+
+        if isinstance(expected, StructResolvedType) and isinstance(actual, StructResolvedType):
+            if expected.name != actual.name:
+                raise LatticeTypeError(
+                    type_mismatch_message(expected, actual, "Incompatible struct types"),
+                    line,
+                    hint=type_mismatch_hint(expected, actual),
+                )
+            if len(expected.fields) != len(actual.fields):
+                raise LatticeTypeError(
+                    f"Struct '{format_type(expected)}' field count mismatch "
+                    f"(expected {len(expected.fields)} fields, got {len(actual.fields)})",
+                    line,
+                )
+            for (exp_name, exp_f), (act_name, act_f) in zip(expected.fields, actual.fields):
+                if exp_name != act_name:
+                    raise LatticeTypeError(
+                        f"Struct field name mismatch on '{format_type(expected)}': "
+                        f"expected '{exp_name}', got '{act_name}'",
+                        line,
+                    )
+                self.types_compatible(exp_f, act_f, line)
+            return
+
+        if isinstance(expected, UnionResolvedType) and isinstance(actual, StructResolvedType):
+            if any(
+                hasattr(v, 'name') and v.name == actual.name
+                for v in expected.variants
+            ):
+                return
+            raise LatticeTypeError(
+                type_mismatch_message(expected, actual, "Expected a union variant"),
+                line,
+                hint="Construct with a matching variant, e.g. Some(value) or None().",
+            )
+
+        if isinstance(expected, UnionResolvedType) and isinstance(actual, UnionResolvedType):
+            if expected.name != actual.name:
+                raise LatticeTypeError(
+                    type_mismatch_message(expected, actual, "Incompatible union types"),
+                    line,
+                    hint=type_mismatch_hint(expected, actual),
+                )
+            return
+
+        if isinstance(expected, IOResolvedType) and isinstance(actual, IOResolvedType):
+            self.types_compatible(expected.inner, actual.inner, line)
+            return
+
+        if type(expected) is not type(actual):
+            raise LatticeTypeError(
+                type_mismatch_message(expected, actual, "Incompatible types"),
+                line,
+                hint=type_mismatch_hint(expected, actual),
+            )
+
+    def check_call_types(self, expr, generic_map=None):
+        if not isinstance(expr, CallExpr) or not isinstance(expr.func, Identifier):
+            return
+
+        func_name = expr.func.name
+        generic_map = generic_map or self.current_generic_map
+        prev_callee = self._checking_call
+        self._checking_call = func_name
+
+        try:
+            self._check_call_types_impl(expr, generic_map, func_name)
+        finally:
+            self._checking_call = prev_callee
+
+    def _check_call_types_impl(self, expr, generic_map, func_name):
+        if func_name in self.functions:
+            callee = self.functions[func_name]
+            if len(expr.args) != len(callee.params):
+                param_names = ", ".join(
+                    f"{p.name}: {format_type_expr(p.type_expr) if p.type_expr else '?'}"
+                    for p in callee.params
+                )
+                raise LatticeTypeError(
+                    f"Wrong number of arguments to '{func_name}': expected {len(callee.params)}, got {len(expr.args)}",
+                    expr.line,
+                    hint=f"Expected signature: {func_name}({param_names})",
+                )
+
+            call_generic_map = {}
+            if callee.generics:
+                for gname, _ in callee.generics:
+                    call_generic_map[gname] = None
+                if expr.generic_args:
+                    for i, (gname, _) in enumerate(callee.generics):
+                        if i < len(expr.generic_args):
+                            call_generic_map[gname] = expr.generic_args[i]
+                else:
+                    for idx, arg in enumerate(expr.args):
+                        if idx < len(callee.params):
+                            arg_t = self.infer_expr_type(arg, generic_map)
+                            self.infer_call_generics(callee.params[idx].type_expr, arg_t, call_generic_map)
+                self.finalize_generic_map(call_generic_map, callee.generics, expr.line, callee_name=func_name)
+
+            for idx, arg in enumerate(expr.args):
+                arg_t = self.infer_expr_type(arg, generic_map)
+                param = callee.params[idx]
+                param_t = self.resolve_type_expr(param.type_expr, call_generic_map or generic_map)
+                if (
+                    callee.kind == 'external'
+                    and not callee.body
+                    and isinstance(param_t, PrimitiveResolvedType)
+                    and param_t.name == 'Integer'
+                    and isinstance(arg_t, (StructResolvedType, UnionResolvedType, ListResolvedType))
+                ):
+                    continue
+                try:
+                    self.types_compatible(param_t, arg_t, expr.line)
+                except LatticeTypeError as e:
+                    raise LatticeTypeError(
+                        f"Argument {idx + 1} ('{param.name}') to '{func_name}': {e.message}",
+                        expr.line,
+                        hint=e.hint or type_mismatch_hint(param_t, arg_t),
+                    ) from e
+            return
+
+        if func_name in self.type_decls:
+            decl = self.type_decls[func_name]
+            if len(expr.args) != len(decl.fields):
+                field_desc = ", ".join(
+                    f"{fname}: {format_type_expr(ftype)}" for fname, ftype in decl.fields
+                )
+                raise LatticeTypeError(
+                    f"Wrong number of arguments to '{func_name}' constructor: "
+                    f"expected {len(decl.fields)}, got {len(expr.args)}",
+                    expr.line,
+                    hint=f"Expected: {func_name}({field_desc})",
+                )
+
+            call_generic_map = {}
+            if decl.generics:
+                for gname, _ in decl.generics:
+                    call_generic_map[gname] = None
+                if expr.generic_args:
+                    for i, (gname, _) in enumerate(decl.generics):
+                        if i < len(expr.generic_args):
+                            call_generic_map[gname] = expr.generic_args[i]
+                else:
+                    for idx, arg in enumerate(expr.args):
+                        if idx < len(decl.fields):
+                            arg_t = self.infer_expr_type(arg, generic_map)
+                            self.infer_call_generics(decl.fields[idx][1], arg_t, call_generic_map)
+                self.finalize_generic_map(call_generic_map, decl.generics, expr.line, callee_name=func_name)
+
+            for idx, arg in enumerate(expr.args):
+                arg_t = self.infer_expr_type(arg, generic_map)
+                fname, field_type_expr = decl.fields[idx]
+                field_t = self.resolve_type_expr(field_type_expr, call_generic_map or generic_map)
+                try:
+                    self.types_compatible(field_t, arg_t, expr.line)
+                except LatticeTypeError as e:
+                    raise LatticeTypeError(
+                        f"Constructor field '{fname}' on '{func_name}': {e.message}",
+                        expr.line,
+                        hint=e.hint,
+                    ) from e
 
     def resolved_to_type_expr(self, r_t, line):
         if not r_t:
@@ -326,6 +603,8 @@ class Resolver:
                     return val
                 if isinstance(val, int):
                     return self.types['Integer']
+                if val is None and expr.name in self.current_generic_map:
+                    return self.types['Integer']
             raise LatticeTypeError(f"Undefined variable '{expr.name}'", expr.line)
 
         if isinstance(expr, BinaryExpr):
@@ -352,12 +631,23 @@ class Resolver:
 
         if isinstance(expr, ListLiteral):
             if not expr.elements:
-                raise LatticeTypeError("Empty list literals are unconstrained. Specify bounds.", expr.line)
+                raise LatticeTypeError(
+                    "Cannot infer type of empty list literal",
+                    expr.line,
+                    hint=(
+                        "Give an explicit type, e.g. let xs: List[5, Integer] = List([]), "
+                        "or initialize with elements: List([1, 2, 3]). " + static_memory_hint()
+                    ),
+                )
             first_t = self.infer_expr_type(expr.elements[0], generic_map)
             for el in expr.elements[1:]:
                 elt = self.infer_expr_type(el, generic_map)
                 if elt.name != first_t.name:
-                    raise LatticeTypeError(f"Type mismatch in list elements: expected {first_t}, got {elt}", expr.line)
+                    raise LatticeTypeError(
+                        f"List elements must have the same type: expected {format_type(first_t)}, "
+                        f"got {format_type(elt)} at position {i + 1}",
+                        expr.line,
+                    )
             te = TypeExpr('List', [Literal(len(expr.elements), 'Integer', expr.line), TypeExpr(first_t.name, [], expr.line)], expr.line)
             return self.resolve_type_expr(te, generic_map)
 
@@ -365,7 +655,10 @@ class Resolver:
             arr_t = self.infer_expr_type(expr.expr, generic_map)
             if isinstance(arr_t, ListResolvedType):
                 return arr_t.elem_type
-            raise LatticeTypeError("Index operation only valid on List types", expr.line)
+            raise LatticeTypeError(
+                f"Cannot index into {format_type(arr_t)} — only List types support []",
+                expr.line,
+            )
 
         if isinstance(expr, FieldExpr):
             struct_t = self.infer_expr_type(expr.expr, generic_map)
@@ -419,9 +712,10 @@ class Resolver:
                                 for gname in call_generic_map:
                                     if call_generic_map[gname] is not None:
                                         local_generic_map[gname] = call_generic_map[gname]
-                                    else:
-                                        # Default mock
-                                        local_generic_map[gname] = self.types['Integer']
+                                self.finalize_generic_map(
+                                    local_generic_map, decl.generics, expr.line,
+                                    callee_name=func_name, allow_function_generics=True,
+                                )
                             
                             arg_names = []
                             for gname, _ in decl.generics:
@@ -457,9 +751,8 @@ class Resolver:
                         gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
                         if gtype_name == 'Type':
                             call_generic_map[gname] = self.types['Integer']
-                        else:
-                            call_generic_map[gname] = 100
-            
+                self.finalize_generic_map(call_generic_map, f_decl.generics, expr.line, callee_name=func_name)
+
             # Infer return type with solved generics
             if f_decl.ret_type:
                 return self.resolve_type_expr(f_decl.ret_type, call_generic_map)
@@ -514,12 +807,64 @@ class Resolver:
             if isinstance(decl, FuncDecl):
                 self.resolve_func_body(decl)
 
+    def check_calls_in_body(self, body):
+        def visit_expr(expr):
+            if isinstance(expr, CallExpr):
+                self.check_call_types(expr)
+                for arg in expr.args:
+                    visit_expr(arg)
+            elif isinstance(expr, BinaryExpr):
+                visit_expr(expr.left)
+                visit_expr(expr.right)
+            elif isinstance(expr, IndexExpr):
+                visit_expr(expr.expr)
+                visit_expr(expr.index)
+            elif isinstance(expr, FieldExpr):
+                visit_expr(expr.expr)
+            elif isinstance(expr, ListLiteral):
+                for el in expr.elements:
+                    visit_expr(el)
+
+        def visit_stmt(stmt):
+            if isinstance(stmt, VarDecl):
+                visit_expr(stmt.value)
+            elif isinstance(stmt, Assign):
+                visit_expr(stmt.target)
+                visit_expr(stmt.value)
+            elif isinstance(stmt, IfStmt):
+                visit_expr(stmt.cond)
+                for s in stmt.then_branch:
+                    visit_stmt(s)
+                for s in stmt.else_branch:
+                    visit_stmt(s)
+            elif isinstance(stmt, ForStmt):
+                visit_expr(stmt.start)
+                visit_expr(stmt.end)
+                for s in stmt.body:
+                    visit_stmt(s)
+            elif isinstance(stmt, MatchStmt):
+                visit_expr(stmt.expr)
+                for case in stmt.cases:
+                    for s in case.body:
+                        visit_stmt(s)
+            elif isinstance(stmt, ReturnStmt):
+                if stmt.expr:
+                    visit_expr(stmt.expr)
+            elif isinstance(stmt, ExprStmt):
+                visit_expr(stmt.expr)
+
+        for stmt in body:
+            visit_stmt(stmt)
+
     def resolve_func_body(self, func):
+        self.current_func = func
         self.locals = {}
+        self.const_locals = set()
         self.local_offset = 0
         self.max_local_offset = 0
         
-        # Build local generic map for function's own generic parameters
+        # Build local generic map for function's own generic parameters.
+        # Size generics stay unresolved during body resolution and are inferred at call sites.
         local_generic_map = {}
         if func.generics:
             for gname, gtype_expr in func.generics:
@@ -527,7 +872,7 @@ class Resolver:
                 if gtype_name == 'Type':
                     local_generic_map[gname] = self.types['Integer']
                 else:
-                    local_generic_map[gname] = 100
+                    local_generic_map[gname] = None
         self.current_generic_map = local_generic_map
         
         self.infer_untyped_parameters(func)
@@ -541,11 +886,14 @@ class Resolver:
         # Parse statements to calculate local offsets
         for stmt in func.body:
             self.resolve_statement(stmt)
+
+        self.check_calls_in_body(func.body)
             
         self.infer_return_type(func)
         self.max_local_offset = self.local_offset
         self.func_locals[func.name] = self.locals
         self.current_generic_map = {}
+        self.current_func = None
 
     def infer_return_type(self, func):
         if func.ret_type is None:
@@ -570,13 +918,24 @@ class Resolver:
             find_returns(func.body)
             if return_types:
                 first_ret = return_types[0]
-                func.ret_type = TypeExpr(first_ret.name, [], func.line)
+                func.ret_type = self.resolved_to_type_expr(first_ret, func.line)
 
     def resolve_statement(self, stmt):
         if isinstance(stmt, VarDecl):
             t = self.resolve_type_expr(stmt.type_expr) if stmt.type_expr else self.infer_expr_type(stmt.value)
+            if stmt.type_expr:
+                try:
+                    self.types_compatible(t, self.infer_expr_type(stmt.value), stmt.line)
+                except LatticeTypeError as e:
+                    raise LatticeTypeError(
+                        f"Variable '{stmt.name}': {e.message}",
+                        stmt.line,
+                        hint=e.hint,
+                    ) from e
             # Allocate local storage
             self.locals[stmt.name] = (t, self.local_offset)
+            if stmt.is_const:
+                self.const_locals.add(stmt.name)
             self.local_offset += t.get_size(self)
             
         elif isinstance(stmt, IfStmt):
@@ -605,27 +964,51 @@ class Resolver:
         elif isinstance(stmt, MatchStmt):
             orig_offset = self.local_offset
             max_case_offset = orig_offset
+            match_type = self.infer_expr_type(stmt.expr)
             for case in stmt.cases:
                 self.local_offset = orig_offset
-                # Add binding parameters of pattern to local scope
-                p_type = self.infer_expr_type(stmt.expr)
+                case_type = match_type
                 if case.pattern.type_bind:
-                    p_type = self.resolve_type_expr(case.pattern.type_bind)
+                    case_type = self.resolve_type_expr(case.pattern.type_bind)
+                elif isinstance(match_type, UnionResolvedType):
+                    for variant in match_type.variants:
+                        vname = getattr(variant, 'name', '')
+                        if vname == case.pattern.name or vname.startswith(f"{case.pattern.name}_"):
+                            if isinstance(variant, StructResolvedType) and variant.fields:
+                                case_type = variant.fields[0][1]
+                            break
                 for arg in case.pattern.args:
-                    self.locals[arg] = (p_type, self.local_offset)
-                    self.local_offset += p_type.get_size(self)
+                    self.locals[arg] = (case_type, self.local_offset)
+                    self.local_offset += case_type.get_size(self)
                 for s in case.body:
                     self.resolve_statement(s)
                 max_case_offset = max(max_case_offset, self.local_offset)
             self.local_offset = max_case_offset
             
         elif isinstance(stmt, Assign):
-            self.infer_expr_type(stmt.target)
-            self.infer_expr_type(stmt.value)
+            if isinstance(stmt.target, Identifier) and stmt.target.name in self.const_locals:
+                raise LatticeTypeError(
+                    f"Cannot assign to const '{stmt.target.name}'",
+                    stmt.line,
+                    hint="Declare a new binding with let if you need mutability.",
+                )
+            target_t = self.infer_expr_type(stmt.target)
+            value_t = self.infer_expr_type(stmt.value)
+            self.types_compatible(target_t, value_t, stmt.line)
             
         elif isinstance(stmt, ReturnStmt):
             if stmt.expr:
-                self.infer_expr_type(stmt.expr)
+                ret_t = self.infer_expr_type(stmt.expr)
+                if self.current_func and self.current_func.ret_type:
+                    expected = self.resolve_type_expr(self.current_func.ret_type)
+                    try:
+                        self.types_compatible(expected, ret_t, stmt.line)
+                    except LatticeTypeError as e:
+                        raise LatticeTypeError(
+                            f"Return type of '{self.current_func.name}': {e.message}",
+                            stmt.line,
+                            hint=e.hint,
+                        ) from e
                 
         elif isinstance(stmt, ExprStmt):
             self.infer_expr_type(stmt.expr)
