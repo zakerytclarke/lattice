@@ -12,6 +12,7 @@ from compiler.resolver import Resolver
 from compiler.verifier import SMTVerifier
 from compiler.emitter import WASMEmitter
 from compiler.stdlib import STDLIB_CODE
+from compiler.entry_metadata import write_main_metadata
 
 # Parse and resolve standard library once globally
 try:
@@ -211,6 +212,20 @@ def main():
     if main_decl.kind != 'external':
         print("Error: The function main must be declared external.")
         sys.exit(1)
+
+    for param in main_decl.params:
+        if param.type_expr is None:
+            print(
+                format_compilation_error(
+                    LatticeTypeError(
+                        f"Parameter '{param.name}' of main must have a type",
+                        main_decl.line,
+                        hint="Add an explicit type annotation or use the parameter so its type can be inferred.",
+                    ),
+                    os.path.basename(source_path),
+                )
+            )
+            sys.exit(1)
         
     # Collect all definitions from standard library and all loaded modules
     all_functions = {}
@@ -255,6 +270,8 @@ def main():
         
     with open(output_path, "wb") as f:
         f.write(wasm_bytes)
+
+    write_main_metadata(main_decl, output_path)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,96 @@
 // Node.js WebAssembly Instantiation and Runner
 
+function loadMainMetadata(fs, wasmPath) {
+    const metaPath = wasmPath + '.meta.json';
+    if (!fs.existsSync(metaPath)) {
+        return null;
+    }
+    return JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+}
+
+function evalConstraintNode(node, value, varName) {
+    if (!node) {
+        return true;
+    }
+    if (node.kind === 'lit') {
+        return node.value;
+    }
+    if (node.kind === 'id') {
+        if (node.name === varName) {
+            return value;
+        }
+        throw new Error(`Unknown identifier '${node.name}' in type constraint`);
+    }
+    if (node.kind === 'bin') {
+        const left = evalConstraintNode(node.left, value, varName);
+        const right = evalConstraintNode(node.right, value, varName);
+        switch (node.op) {
+            case '&&': return left && right;
+            case '||': return left || right;
+            case '>': return left > right;
+            case '<': return left < right;
+            case '>=': return left >= right;
+            case '<=': return left <= right;
+            case '==': return left === right;
+            case '!=': return left !== right;
+            default:
+                throw new Error(`Unsupported constraint operator '${node.op}'`);
+        }
+    }
+    throw new Error('Invalid type constraint metadata');
+}
+
+function constraintSatisfied(param, value) {
+    if (!param.constraint) {
+        return true;
+    }
+    return !!evalConstraintNode(param.constraint, value, param.constraint_var || 'x');
+}
+
+function formatParamUsage(params) {
+    if (params.length === 0) {
+        return '';
+    }
+    return ' ' + params.map((p) => `[${p.name}: ${p.type}]`).join(' ');
+}
+
+function validateMainArgs(rawArgs, metadata) {
+    if (!metadata || !metadata.main) {
+        return rawArgs.map(Number);
+    }
+
+    const params = metadata.main.params || [];
+    if (rawArgs.length !== params.length) {
+        const expected = params.length === 0
+            ? 'no arguments'
+            : `${params.length} argument(s): ${params.map((p) => `${p.name}: ${p.type}`).join(', ')}`;
+        const got = rawArgs.length === 0 ? 'no arguments' : `${rawArgs.length} argument(s)`;
+        throw new Error(
+            `main expects ${expected}, but received ${got}.` +
+            `\nUsage: lattice <source.lattice>${formatParamUsage(params)}`
+        );
+    }
+
+    const parsed = [];
+    for (let i = 0; i < params.length; i++) {
+        const param = params[i];
+        const raw = rawArgs[i];
+        const value = Number(raw);
+        if (raw === '' || !Number.isFinite(value) || !Number.isInteger(value)) {
+            throw new Error(
+                `Argument '${param.name}' must be of type ${param.type}, but got '${raw}'.`
+            );
+        }
+        if (!constraintSatisfied(param, value)) {
+            throw new Error(
+                `Argument '${param.name}' must satisfy type ${param.type}, but got ${value}.`
+            );
+        }
+        parsed.push(value);
+    }
+    return parsed;
+}
+
 (async () => {
     let fs, cp;
     if (typeof require !== 'undefined') {
@@ -22,6 +113,7 @@
     }
 
     const wasmBuffer = fs.readFileSync(wasmPath);
+    const mainMetadata = loadMainMetadata(fs, wasmPath);
 
     let exports;
     let heapPtr = 50000; // Safe start of temp heap for runtime allocations
@@ -205,12 +297,15 @@
     try {
         const result = await WebAssembly.instantiate(wasmBuffer, imports);
         exports = result.instance.exports;
-        
-        if (exports.main) {
-            const args = process.argv.slice(3).map(Number);
-            
+    } catch (err) {
+        console.error("WebAssembly Instantiation Failed:", err);
+        process.exit(1);
+    }
 
-            
+    try {
+        if (exports.main) {
+            const rawArgs = process.argv.slice(3);
+            const args = validateMainArgs(rawArgs, mainMetadata);
             const ret = exports.main(...args);
             if (ret !== undefined) {
                 console.log(ret);
@@ -225,7 +320,7 @@
             console.log("WASM loaded, but found no entry point 'main' or 'app_entry'.");
         }
     } catch (err) {
-        console.error("WebAssembly Instantiation Failed:", err);
+        console.error("Error:", err.message || err);
         process.exit(1);
     }
 })();

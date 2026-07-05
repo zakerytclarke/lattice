@@ -88,7 +88,7 @@ def format_type_expr(te):
         base = te.name
     if getattr(te, 'constraint', None) is not None:
         var = getattr(te, 'constraint_var', 'x')
-        return f"{base}({var}){{...}}"
+        return f"{base}({var}){{{format_expr(te.constraint)}}}"
     return base
 
 
@@ -118,7 +118,7 @@ def format_type(resolved_type):
         return resolved_type.name
 
     if kind == 'RefinedResolvedType':
-        return f"{format_type(resolved_type.base_type)}({resolved_type.constraint_var}){{...}}"
+        return f"{format_type(resolved_type.base_type)}({resolved_type.constraint_var}){{{format_expr(resolved_type.constraint)}}}"
 
     if kind == 'ListResolvedType':
         length = resolved_type.length
