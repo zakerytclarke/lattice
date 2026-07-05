@@ -1,208 +1,391 @@
 # Lattice Language Specification
 
-Lattice is a modern, statically typed, compiled systems programming language designed for predictability, safety, and high performance. It compiles directly to WebAssembly (WASM) and is designed to run in sandboxed, resource-constrained environments.
+This document describes the **current** Lattice language as implemented by the compiler and validated by the test suite in `tests/`. When in doubt, treat the tests as the source of truth.
+
+Lattice is a statically typed language that compiles to WebAssembly. Programs have fixed memory bounds known at compile time, and the compiler uses an SMT solver (Z3) to reject unsafe code before it runs.
 
 ---
 
-## 1. Core Philosophy & Guarantees
+## 1. Core Principles
 
-1. **Zero Dynamic Allocation:** Lattice does not have a runtime heap or garbage collector. All memory sizes, capacities, and layout bounds must be known or bounded at compile time.
-2. **Compile-Time Termination Proofs:** Except for explicitly declared infinite loops driven by external runtime events, all recursion and loops must be provably terminating at compile time. The compiler utilizes an integrated SMT solver to enforce this.
-3. **Memory Safety without Overhead:** Buffer bounds checks are validated at compile time by the SMT solver. Out-of-bounds access triggers a compile-time type error rather than a runtime panic or crash.
-4. **Strong Typing & Ergonomic Inference:** Lattice is strongly typed but types can be omitted in most places (variables, parameter types where constraints allow, and return types) and are automatically inferred by the compiler from operation flow.
+1. **Fixed memory, no heap.** All data structures have compile-time-known sizes. There is no garbage collector and no dynamic allocation in generated WASM.
+2. **Compile-time safety proofs.** Index bounds, refined type constraints, division-by-zero, and struct invariants are checked by Z3. Failures are compile errors, not runtime panics.
+3. **Compile-time termination checks.** Recursive functions must use arguments that the verifier can prove decrease on each call.
+4. **Strong typing with inference.** Types can be omitted in many places; the compiler infers them from usage.
+5. **Explicit boundaries.** Only `external` functions and types can cross module boundaries. `main` must be `external` and defined in the entry file.
 
 ---
 
-## 2. Syntax & Lexical Grammar
+## 2. Getting Started
 
-### 2.1 Variable Bindings
-Variables are declared using only two keywords:
-- **`let`**: A mutable variable. It can be re-assigned.
-- **`const`**: An immutable variable. Its value is fixed upon initialization.
+```bash
+# Install dependencies
+pip install z3-solver pytest
 
-```rust
-let x = 5;            // Mutable variable
+# Compile and run a program
+./lattice tests/factorial.lattice 5
+
+# Run the test suite
+python3 -m pytest tests/test_lattice.py -v
+```
+
+A Lattice program is a `.lattice` file. The `./lattice` script compiles it to WASM and runs it with Node.js.
+
+---
+
+## 3. Lexical Syntax
+
+- **Comments:** `//` to end of line
+- **Identifiers:** letters, digits, underscores; must not start with a digit
+- **String/char literals:** single-quoted characters, e.g. `'A'`, `'h'`
+- **Integer literals:** decimal integers, e.g. `42`, `-1`
+- **Boolean literals:** `true`, `false`
+- **Semicolons:** optional in many places
+
+---
+
+## 4. Variables
+
+```lattice
+let x = 5;          // mutable
 x = x + 1;
 
-const pi = 3.14159;   // Immutable variable
+const y = 10;       // immutable after initialization
 ```
 
-*Note on memory allocation:* Since there is no dynamic allocation, all variable sizes are determined at compile-time. The compiler automatically handles static storage placement in WASM memory for variables whose lifetimes or sizes require static allocation.
+Function parameters can be marked `let` (mutable) or `const` (immutable):
 
-### 2.2 Function Declarations
-Functions are declared using the `function` keyword.
-
-```rust
-function add(a, b) {
-    return a + b;
+```lattice
+function set[N: Integer, T: Type](let list: List[N, T], idx: Integer, val: T) -> List[N, T] {
+    // ...
 }
 ```
-
-Types can be explicitly written if desired:
-```rust
-function add(a: Int, b: Int) -> Int {
-    return a + b;
-}
-```
-
-#### Special Entry Points:
-1. **`external function`**: Exposes the function to the host environment (e.g. CLI arguments or WASM imports).
-   ```rust
-   external function main(args: List[2, String[64]]) -> Int { ... }
-   ```
-2. **`server function`**: Compiles into a network service endpoint. The compiler generates input validation guards automatically based on type invariants.
-   ```rust
-   server function get_user(id) { ... }
-   ```
 
 ---
 
-## 3. Type System & Unions
+## 5. Types
 
-### 3.1 Primitive Types
-- `Int`: An integer value. The SMT solver evaluates range bounds to minimize WASM width representations (e.g., `i32`, `i64`).
-- `Bool`: A boolean value (`true` or `false`).
-- `Char`: A single Unicode code point.
-- `String[MaxLen: Int]`: A fixed-capacity sequence of UTF-8 characters.
-- `Type`: The metatype of all types, used in generic definitions.
+### 5.1 Primitive types
 
-### 3.2 Structs and Parameterized Types
-Types are defined using the `type` keyword. Struct types can accept both compile-time value parameters and type parameters. Type constraints are declared in trailing braces `{ ... }`.
+| Type | Description |
+|------|-------------|
+| `Integer` | Signed integer (represented as i32 in WASM) |
+| `Bool` | `true` or `false` |
+| `Char` | Single Unicode code point |
+| `Type` | Metatype used in generic parameters |
+| `void` | No value (used with `IO[void]`) |
 
-```rust
-type List[LenList: Int, Elem: Type](data: BuiltinRawBuffer(LenList)[Elem]) {
-    LenList >= 0
+### 5.2 Refined types
+
+Attach a logical constraint to a type using `(var){constraint}`:
+
+```lattice
+function add_safe(
+    a: Integer(x){x >= 0 && x <= 50},
+    b: Integer(y){y >= 0 && y <= 50}
+) -> Integer(z){z >= 0 && z <= 100} {
+    return a + b;
 }
+```
 
-type Rational(Numerator: Int, Denominator: Int) {
+The SMT solver must be able to prove that operations preserve these constraints. If `a + b` could exceed the return bound, compilation fails (see `tests/arithmetic_unsafe_bounds.lattice`).
+
+### 5.3 Struct types
+
+```lattice
+type Rational(Numerator: Integer, Denominator: Integer) {
     Denominator != 0
 }
 ```
 
-### 3.3 Native Union & Grouped Types
-Union types represent structural sum types. They can be parameterized or plain.
+- Fields are declared in parentheses.
+- Invariants in trailing `{ ... }` are enforced by the SMT solver at construction and use sites.
 
-```rust
-type Number = Union[Int, Rational]
+Construct with named or positional arguments:
+
+```lattice
+const r = Rational(3, 4);
+```
+
+### 5.4 Union types
+
+```lattice
 type Input[T: Type] = Union[Some[T], None]
+
+type Some[T: Type](Value: T)
+type None
 ```
 
-### 3.4 Exhaustive Pattern Matching
-Unwrapping union or grouped types is performed using the `match` expression. The compiler **exhaustively checks** that all potential types of the union are handled. If any potential type variant is omitted, the compiler throws an error.
+Construct variants:
 
-```rust
-match try_value {
-    Some(val) => {
-        print(val);
-    }
-    None => {
-        log_error("Value not present");
-    }
+```lattice
+let present: Input[Integer] = Some(42);
+let absent: Input[Integer] = None();
+```
+
+### 5.5 Generic types
+
+Type parameters use square brackets with optional kind annotations:
+
+```lattice
+type List[LenList: Integer, Elem: Type](data: Group[LenList, Elem]) {
+    LenList >= 0
 }
 ```
 
-### 3.5 Multi-Dispatch Overloading & Union Resolution
-Lattice supports ad-hoc polymorphism through multi-dispatch overloading. Functions can be defined multiple times with different type signatures:
+`Group[Len, Elem]` is a compiler builtin representing a fixed-size contiguous buffer. It is used internally by `List` and is not typically referenced directly in user code.
 
-```rust
-function add(a: Int, b: Int) -> Int {
-    return a + b;
-}
+### 5.6 `List[N, T]`
 
-function add(a: Rational, b: Rational) -> Rational {
-    return Rational(
-        a.Numerator * b.Denominator + b.Numerator * a.Denominator, 
-        a.Denominator * b.Denominator
-    );
+A fixed-capacity array of `N` elements of type `T`:
+
+```lattice
+let my_list: List[5, Integer] = List([0, 0, 0, 0, 0]);
+```
+
+Access the backing buffer via `.data`:
+
+```lattice
+my_list.data[idx]
+```
+
+List literals use square brackets: `[1, 2, 3]`.
+
+### 5.7 `String[MaxLen]`
+
+A bounded string with a runtime length no greater than `MaxLen`:
+
+```lattice
+type String[MaxLen: Integer](len: Integer, data: List[MaxLen, Char]) {
+    len >= 0 && len <= MaxLen
 }
 ```
 
-#### Exhaustive Multi-Dispatch Verification:
-If a variable of a union type `x: Union[Int, Rational]` is passed to `add(x, y)`:
-1. The compiler checks every possible concrete type combination from the union arguments.
-2. It verifies that a valid overloaded implementation of `add` (or a coercion rule, e.g. `Int` promoted to `Rational`) exists for every combination.
-3. If any path is unhandled (e.g. if `add(Rational, Int)` cannot be resolved or promoted), it raises a compile-time type-resolution error.
+Construct with length first, then the character list:
+
+```lattice
+let msg: String[12] = String(12, List(['H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', '!']));
+```
+
+Access characters through `s.data.data[idx]` after proving `idx < s.len`.
+
+### 5.8 `IO[T]`
+
+Marks a computation that performs host side effects. The inner type `T` is the result. IO operations are provided by the standard library and host runtime.
 
 ---
 
-## 4. Zero-Allocation SMT Verification
+## 6. Functions
 
-The core feature of Lattice is the verification of memory access and safety invariants at compile time.
+### 6.1 Declaration syntax
 
-### 4.1 Index Bounds Verification
-Every array or list access `list[index]` is validated before compilation. If the compiler cannot prove that $0 \le \text{index} < \text{list.LenList}$, it fails with an index constraint error.
-
-```rust
-function get_element[N: Int, T: Type](list: List[N, T], index: Int) -> T {
-    // SMT verifies index bounds
-    return list.data[index];
+```lattice
+function name[Generics](params) -> ReturnType {
+    // body
 }
 ```
 
-To resolve bounds errors on runtime variables, the programmer must guard the index access:
+Return type and parameter types can be omitted when inferable.
 
-```rust
-if (index >= 0 && index < N) {
-    let item = get_element(list, index); // Compiles successfully!
+### 6.2 Function kinds
+
+| Kind | Syntax | Purpose |
+|------|--------|---------|
+| Normal | `function foo(...)` | Internal logic |
+| External | `external function foo(...)` | Exported to host or other modules |
+| Server | `server function foo(...)` | Parsed but not yet code-generated |
+
+### 6.3 Preconditions
+
+Place constraints between the signature and body. They must hold for the function to be called safely:
+
+```lattice
+function get[N: Integer, T: Type](list: List[N, T], idx: Integer) -> T {
+    idx >= 0 && idx < N;
+} {
+    return list.data[idx];
+}
+```
+
+The caller must establish these facts (via guards, refined types, or prior checks) or compilation fails.
+
+### 6.4 Entry point: `main`
+
+Every program must define `external function main` **in the entry source file**:
+
+```lattice
+external function main(n) {
+    return factorial(n);
+}
+```
+
+Rules enforced by the compiler:
+
+- `main` cannot be imported from another module
+- `main` must use the `external` modifier
+- `main` must be defined in the file passed to the compiler
+
+CLI arguments are passed as integers from the host.
+
+---
+
+## 7. Control Flow
+
+### 7.1 Conditionals
+
+```lattice
+if (n == 1) {
+    return 1;
+} else {
+    return n * factorial(n - 1);
+}
+```
+
+Guards that establish bounds or constraints allow the verifier to accept otherwise unsafe operations:
+
+```lattice
+if (idx >= 0 && idx < N) {
+    return list.data[idx];  // safe inside the guard
+}
+```
+
+### 7.2 Pattern matching
+
+`match` must be **exhaustive** over all union variants:
+
+```lattice
+match (opt) {
+    Some(val) => { return val; }
+    None => { return default_val; }
+}
+```
+
+Omitting a variant is a compile error (see `tests/option_unsafe.lattice`).
+
+---
+
+## 8. Imports and Modules
+
+Import symbols from other `.lattice` files:
+
+```lattice
+import Fraction, multiply_frac from 'math_utils.lattice';
+import * from 'math_utils.lattice';
+import add_five from 'dep_b.lattice';
+```
+
+Rules:
+
+- Only `external function` and `external type` declarations are importable
+- Internal functions and non-external types cannot be imported (see `tests/import_test_unsafe_internal.lattice`)
+- Redefining stdlib or imported symbols is an error
+- Transitive imports are supported (`dep_b` → `dep_c`)
+
+Export from a module:
+
+```lattice
+external type Fraction(num: Integer, den: Integer) {
+    den != 0
+}
+
+external function multiply_frac(a: Fraction, b: Fraction) -> Fraction {
+    return Fraction(a.num * b.num, a.den * b.den);
 }
 ```
 
 ---
 
-## 5. Recursion & Termination Constraints
+## 9. Standard Library
 
-Recursive functions must either be in tail-recursive form or accept a decreasing variant parameter (like `depth`) that guarantees termination.
+The standard library is embedded in `compiler/stdlib.py` and loaded automatically. It provides:
 
-```rust
-function contains[Depth: Int](tree: Tree[Depth, Int], val: Int) -> Bool {
-    match tree {
-        Empty => {
-            return false;
-        }
-        Node(node_val, left, right) => {
-            if (val == node_val) {
-                return true;
-            } else if (val < node_val) {
-                return contains[Depth - 1](left, val);
-            } else {
-                return contains[Depth - 1](right, val);
-            }
-        }
-    }
-}
+**Types:** `Rational`, `Input`, `Some`, `None`, `List`, `String`
+
+**Rational arithmetic:** `add`, `sub`, `mul`, `div` (with non-zero divisor checks)
+
+**IO:**
+
+| Function | Description |
+|----------|-------------|
+| `print_char(c: Char) -> IO[void]` | Print one character |
+| `print_string(s: String[N]) -> IO[void]` | Print a string |
+| `read_int() -> IO[Input[Integer]]` | Read integer from stdin |
+| `read_string[N]() -> IO[Input[String[N]]]` | Read string from stdin |
+| `read_file[N, P](path: String[P]) -> IO[Input[String[N]]]` | Read file contents |
+| `http_get[N, U](url: String[U]) -> IO[Input[String[N]]]` | HTTP GET (host uses curl) |
+
+---
+
+## 10. Safety Verification
+
+The compiler rejects programs it cannot prove safe. The test suite in `tests/tests.json` documents expected behavior.
+
+### 10.1 Index bounds
+
+List and string indexing requires a proof that `0 <= index < length`. Unguarded out-of-bounds access fails (see `tests/list_unsafe.lattice`, `tests/string_unsafe.lattice`).
+
+### 10.2 Refined type constraints
+
+Arithmetic results must satisfy declared output constraints (see `tests/arithmetic_unsafe_bounds.lattice`).
+
+### 10.3 Division and invariants
+
+Division by zero and violated struct invariants are rejected (see `tests/arithmetic_unsafe_div.lattice`).
+
+### 10.4 Termination
+
+Recursion must decrease a provably positive argument. Increasing recursion (`n + 1`) is rejected (see `tests/factorial_incorrect_termination.lattice`).
+
+### 10.5 Match exhaustiveness
+
+All union variants must be handled (see `tests/option_unsafe.lattice`).
+
+### 10.6 Module boundaries
+
+Importing non-external symbols fails. Redefining stdlib symbols fails.
+
+---
+
+## 11. Compilation Pipeline
+
+```
+.lattice source
+    → parse (parser.py)
+    → resolve types & monomorphize (resolver.py)
+    → verify safety with Z3 (verifier.py)
+    → emit WASM binary (emitter.py)
+    → run via Node.js host (run_wasm.js)
 ```
 
 ---
 
-## 6. Input / Output, Effects, & HTTP Communication
+## 12. Reference Programs
 
-Side effects in Lattice are tracked using the `IO[T]` effect type.
+The `tests/` directory contains canonical Lattice programs. Start with these:
 
-### HTTP Response Parsing & Validation Example
-Runtime network calls are performed via `http_get` which returns `IO[Response]`. To safely handle raw payload parsing without dynamic heap allocation, the response validation and parsing follow a strict unwrapping flow:
+| File | Demonstrates |
+|------|--------------|
+| `factorial.lattice` | Recursion with refined types |
+| `arithmetic_safe.lattice` | Refined integers and rationals |
+| `list_safe.lattice` | Fixed lists, preconditions, mutation |
+| `option_safe.lattice` | Union types and exhaustive match |
+| `string_safe.lattice` | Bounded strings |
+| `io_safe.lattice` | Printing |
+| `io_advanced_safe.lattice` | File I/O |
+| `import_test_safe.lattice` | Module imports |
+| `import_transitive_safe.lattice` | Transitive imports |
 
-```rust
-type Response(Status: Int, Body: String[1024])
+Files ending in `_unsafe` or listed with `"should_fail": true` in `tests/tests.json` show programs the compiler correctly rejects.
 
-type User(Id: Int, Name: String[64])
+---
 
-function parse_user(body: String[1024]) -> Union[Some[User], None] {
-    // Parser validation logic...
-}
+## 13. Known Limitations
 
-function fetch_user(url: String[256]) -> IO[Union[Some[User], None]] {
-    const response = http_get(url); // Returns Response struct
-    
-    // 1. Validate response status code
-    if (response.Status == 200) {
-        // 2. Parse response body and return Union[Some[User], None]
-        return parse_user(response.Body);
-    } else {
-        return None;
-    }
-}
-```
-In this example:
-- The network call status is verified.
-- The payload is parsed within a fixed capacity string buffer.
-- The result is wrapped in the structural union `Union[Some[User], None]`, forcing the caller to handle success and failure exhaustively using `match`.
+These are **not** part of the current language, even if they appear in older drafts:
+
+- No dynamic allocation or unbounded collections
+- No general multi-dispatch overloading (stdlib defines explicit `add` for `Rational`)
+- `server function` is parsed but not code-generated
+- `IO[T]` is not enforced as an effect system; it documents host interactions
+- WASM values are lowered primarily as i32; width optimization is not yet implemented
+- CLI `main` arguments are untyped integers from the host
