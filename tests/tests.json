@@ -158,5 +158,21 @@
         "expected": 15
       }
     ]
+  },
+  {
+    "file": "const_reassign_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "unresolved_generic_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "call_arity_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "arithmetic_call_unsafe.lattice",
+    "should_fail": true
   }
 ]
