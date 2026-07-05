@@ -138,5 +138,25 @@
   {
     "file": "main_imported.lattice",
     "should_fail": true
+  },
+  {
+    "file": "import_star_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": 3
+      }
+    ]
+  },
+  {
+    "file": "import_transitive_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": 15
+      }
+    ]
   }
 ]
