@@ -1,0 +1,13 @@
+function factorial_incorrect_termination(n: Integer(x){x > 0}) -> Integer {
+    if (n <= 1) {
+        return 1;
+    } else {
+        return n * factorial_incorrect_termination(n+1); // Infinite Recursion error 
+    }
+}
+
+
+
+external function main(n) {
+    return factorial_incorrect_termination(n);
+}

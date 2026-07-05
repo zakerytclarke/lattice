@@ -1,0 +1,5 @@
+import internal_helper from 'math_utils.lattice';
+
+external function main() {
+    return internal_helper();
+}

@@ -1,0 +1,3 @@
+external function add_three(n: Integer) -> Integer {
+    return n + 3;
+}

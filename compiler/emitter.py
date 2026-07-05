@@ -66,28 +66,66 @@ class WASMEmitter:
         self.data_offset = 1024   # Start static data after memory offset 1024
 
     def compile(self, prog):
-        # 1. Setup default print functions
-        # For simplicity, we import printing from env
-        self.add_import("env", "print_int", b'\x00', [TYPE_I32], [])
+        # Export memory to JS
+        self.export_section.append(encode_string("memory") + b'\x02\x00')
+        
+        # 1. Setup external imports dynamically
+        for name, decl in self.resolver.functions.items():
+            is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
+            if is_import:
+                params = [TYPE_I32] * len(decl.params)
+                ret = []
+                if decl.ret_type:
+                    temp_generic_map = {}
+                    if decl.generics:
+                        for gname, gtype_expr in decl.generics:
+                            gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
+                            if gtype_name == 'Type':
+                                temp_generic_map[gname] = self.resolver.types['Integer']
+                            else:
+                                temp_generic_map[gname] = 100
+                    ret_t = self.resolver.resolve_type_expr(decl.ret_type, temp_generic_map)
+                    if isinstance(ret_t, IOResolvedType):
+                        ret_t = ret_t.inner
+                    if ret_t and not (isinstance(ret_t, PrimitiveResolvedType) and ret_t.name == 'void'):
+                        ret = [TYPE_I32]
+                self.add_import("env", name, b'\x00', params, ret)
+                self.func_indices[name] = len(self.import_section) - 1
         
         # 2. Assign indices to declared functions
         for name, decl in self.resolver.functions.items():
-            if name == 'print_int':
+            is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
+            if is_import:
                 continue
             params = [TYPE_I32] * len(decl.params)
-            ret = [TYPE_I32] if decl.ret_type and decl.ret_type.name != 'void' else []
+            ret = []
+            if decl.ret_type:
+                temp_generic_map = {}
+                if decl.generics:
+                    for gname, gtype_expr in decl.generics:
+                        gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
+                        if gtype_name == 'Type':
+                            temp_generic_map[gname] = self.resolver.types['Integer']
+                        else:
+                            temp_generic_map[gname] = 100
+                ret_t = self.resolver.resolve_type_expr(decl.ret_type, temp_generic_map)
+                if isinstance(ret_t, IOResolvedType):
+                    ret_t = ret_t.inner
+                if ret_t and not (isinstance(ret_t, PrimitiveResolvedType) and ret_t.name == 'void'):
+                    ret = [TYPE_I32]
             t_idx = self.add_type_signature(params, ret)
             self.func_indices[name] = len(self.import_section) + len(self.func_section)
             self.func_section.append(encode_leb128(t_idx))
 
         # 3. Compile function bodies
         for name, decl in self.resolver.functions.items():
-            if decl.kind in ['normal', 'server', 'external'] and name != 'print_int':
+            is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
+            if decl.kind in ['normal', 'server', 'external'] and not is_import:
                 body_bytes = self.compile_function(decl)
                 self.code_section.append(body_bytes)
                 
             # Export main/external entry points
-            if decl.name in ['main', 'app_entry'] or decl.kind == 'external':
+            if decl.name in ['main', 'app_entry'] or (decl.kind == 'external' and not is_import):
                 self.export_section.append(
                     encode_string(decl.name) + b'\x00' + encode_leb128(self.func_indices[decl.name])
                 )
@@ -113,35 +151,77 @@ class WASMEmitter:
     def compile_function(self, func):
         self.resolver.locals = self.resolver.func_locals[func.name]
         self.wasm_locals = {}
+        
+        # Build local generic map for function's own generic parameters
+        local_generic_map = {}
+        if func.generics:
+            for gname, gtype_expr in func.generics:
+                gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
+                if gtype_name == 'Type':
+                    local_generic_map[gname] = self.resolver.types['Integer']
+                else:
+                    local_generic_map[gname] = 100
+        self.resolver.current_generic_map = local_generic_map
+
         # Parameters occupy local indices starting from 0
         for i, param in enumerate(func.params):
             self.wasm_locals[param.name] = i
         self.local_count = len(func.params)
         
         # Local variables map to subsequent local indices
-        locals_to_declare = []
         for name, (ltype, _) in self.resolver.locals.items():
             if name not in self.wasm_locals:
                 self.wasm_locals[name] = self.local_count
-                locals_to_declare.append(TYPE_I32)
                 self.local_count += 1
                 
         # Instructions bytecode
         code = bytearray()
+        
+        # Compile parameter constraints checks for 'main'
+        if func.name == 'main':
+            for i, param in enumerate(func.params):
+                param_t = self.resolver.resolve_type_expr(param.type_expr)
+                curr_t = param_t
+                while isinstance(curr_t, RefinedResolvedType):
+                    if curr_t.constraint:
+                        # Compile constraint check
+                        old_local_map = self.wasm_locals.copy()
+                        if curr_t.constraint_var:
+                            self.wasm_locals[curr_t.constraint_var] = i
+                        
+                        constraint_code = self.compile_expr(curr_t.constraint)
+                        self.wasm_locals = old_local_map
+                        
+                        code.extend(constraint_code)
+                        code.append(0x45) # i32.eqz
+                        code.append(0x04) # if
+                        code.append(0x40) # void block
+                        code.append(0x00) # unreachable
+                        code.append(0x0b) # end if
+                    curr_t = curr_t.base_type
+                    
         for stmt in func.body:
             code.extend(self.compile_statement(stmt))
             
-        if func.ret_type and func.ret_type.name != 'void':
+        has_ret = False
+        if func.ret_type:
+            ret_t = self.resolver.resolve_type_expr(func.ret_type)
+            if isinstance(ret_t, IOResolvedType):
+                ret_t = ret_t.inner
+            if ret_t and not (isinstance(ret_t, PrimitiveResolvedType) and ret_t.name == 'void'):
+                has_ret = True
+        if has_ret:
             code.append(0x41) # i32.const
             code.extend(encode_sleb128(0))
             
         code.append(0x0b) # End function body
+        self.resolver.current_generic_map = {}
         
         # Local declarations vector
+        num_locals_to_declare = self.local_count - len(func.params)
         local_decls = []
-        if locals_to_declare:
-            # Group consecutive locals of same type
-            local_decls.append(encode_leb128(len(locals_to_declare)) + TYPE_I32)
+        if num_locals_to_declare > 0:
+            local_decls.append(encode_leb128(num_locals_to_declare) + TYPE_I32)
             
         func_body = encode_vector(local_decls) + bytes(code)
         return encode_leb128(len(func_body)) + func_body
@@ -276,14 +356,34 @@ class WASMEmitter:
                 code.append(0x04) # if
                 code.append(0x40) # void
                 
+                # Unpack union type
+                expr_t = self.resolver.infer_expr_type(stmt.expr)
+                if isinstance(expr_t, IOResolvedType):
+                    expr_t = expr_t.inner
+                    
+                variant_resolved_t = None
+                if isinstance(expr_t, UnionResolvedType):
+                    for var_t in expr_t.variants:
+                        if var_t.name.split('_')[0] == case.pattern.name:
+                            variant_resolved_t = var_t
+                            break
+                            
                 # Bind match variables if any to memory offset or local
                 for arg_idx, arg in enumerate(case.pattern.args):
-                    # Load value from variant fields (starting at offset 1 after the tag byte)
+                    field_offset = 1
+                    if variant_resolved_t:
+                        for prev_idx in range(arg_idx):
+                            if prev_idx < len(variant_resolved_t.fields):
+                                field_offset += variant_resolved_t.fields[prev_idx][1].get_size(self.resolver)
+                            else:
+                                field_offset += 4
+                                
                     code.append(0x20) # local.get
                     code.extend(encode_leb128(temp_idx))
                     code.append(0x41) # offset of field
-                    code.extend(encode_sleb128(1 + arg_idx * 4))
+                    code.extend(encode_sleb128(field_offset))
                     code.append(0x6a) # add
+                    
                     code.append(0x28) # i32.load
                     code.extend(b'\x02\x00')
                     
@@ -305,6 +405,8 @@ class WASMEmitter:
             code.extend(self.compile_expr(stmt.expr))
             # Pop stack if expression returns a value but statement ignores it
             expr_t = self.resolver.infer_expr_type(stmt.expr)
+            if isinstance(expr_t, IOResolvedType):
+                expr_t = expr_t.inner
             if expr_t and expr_t.name != 'void':
                 code.append(0x1a) # drop
                 
@@ -313,14 +415,25 @@ class WASMEmitter:
     def compile_expr(self, expr):
         code = bytearray()
         if isinstance(expr, Literal):
-            if expr.val_type in ['Integer', 'Char']:
+            if expr.val_type == 'Integer':
                 code.append(0x41) # i32.const
                 code.extend(encode_sleb128(expr.value))
+            elif expr.val_type == 'Char':
+                val = ord(expr.value) if isinstance(expr.value, str) else int(expr.value)
+                code.append(0x41) # i32.const
+                code.extend(encode_sleb128(val))
             elif expr.val_type == 'Bool':
                 code.append(0x41) # i32.const
                 code.extend(encode_sleb128(1 if expr.value else 0))
                 
         elif isinstance(expr, Identifier):
+            # Check if generic constant
+            if expr.name in self.resolver.current_generic_map:
+                val = self.resolver.current_generic_map[expr.name]
+                if isinstance(val, int):
+                    code.append(0x41) # i32.const
+                    code.extend(encode_sleb128(val))
+                    return code
             # Check local index
             if expr.name in self.wasm_locals:
                 l_idx = self.wasm_locals[expr.name]
@@ -373,10 +486,15 @@ class WASMEmitter:
             struct_t = self.resolver.infer_expr_type(expr.expr)
             if isinstance(struct_t, ListResolvedType) and expr.field == 'data':
                 code.extend(self.compile_expr(expr.expr))
+                # Load pointer from offset 0
+                code.append(0x28)
+                code.extend(b'\x02\x00')
             else:
                 field_offset = 0
+                target_ftype = None
                 for name, ftype in struct_t.fields:
                     if name == expr.field:
+                        target_ftype = ftype
                         break
                     field_offset += ftype.get_size(self.resolver)
                     
@@ -394,10 +512,48 @@ class WASMEmitter:
             if func_name in self.resolver.type_decls or func_name in self.resolver.types:
                 # Constructor!
                 struct_t = self.resolver.infer_expr_type(expr)
-                addr = self.data_offset
-                self.data_offset += struct_t.get_size(self.resolver)
                 
+                # Check if this constructor is a union variant
+                union_decl = None
+                variant_tag = -1
+                for decl_name, decl in self.resolver.type_decls.items():
+                    if isinstance(decl, UnionTypeDecl):
+                        for tag, vexpr in enumerate(decl.variants):
+                            if vexpr.name == func_name:
+                                union_decl = decl
+                                variant_tag = tag
+                                break
+                                
+                union_size = 0
+                if variant_tag != -1:
+                    union_te = TypeExpr(
+                        union_decl.name, 
+                        [self.resolver.resolved_to_type_expr(v, expr.line) for v in getattr(struct_t, 'generic_map', {}).values()], 
+                        expr.line
+                    )
+                    union_t = self.resolver.resolve_type_expr(union_te)
+                    if union_t:
+                        union_size = union_t.get_size(self.resolver)
+                    else:
+                        union_size = 1 + struct_t.get_size(self.resolver)
+                        
+                addr = self.data_offset
+                if union_size > 0:
+                    self.data_offset += union_size
+                else:
+                    self.data_offset += struct_t.get_size(self.resolver)
+                    
                 field_offset = 0
+                if variant_tag != -1:
+                    # Write tag byte
+                    code.append(0x41) # address
+                    code.extend(encode_sleb128(addr))
+                    code.append(0x41) # tag val
+                    code.extend(encode_sleb128(variant_tag))
+                    code.append(0x3a) # i32.store8
+                    code.extend(b'\x00\x00')
+                    field_offset = 1
+                    
                 for i, arg in enumerate(expr.args):
                     code.append(0x41) # address
                     code.extend(encode_sleb128(addr + field_offset))
@@ -427,6 +583,9 @@ class WASMEmitter:
                 # Assuming list contains numeric literals or compile-time constants
                 if isinstance(el, Literal) and el.val_type == 'Integer':
                     data_bytes.extend(el.value.to_bytes(4, byteorder='little', signed=True))
+                elif isinstance(el, Literal) and el.val_type == 'Char':
+                    val = ord(el.value) if isinstance(el.value, str) else int(el.value)
+                    data_bytes.extend(val.to_bytes(4, byteorder='little', signed=True))
                 else:
                     data_bytes.extend(int(0).to_bytes(4, byteorder='little'))
                     

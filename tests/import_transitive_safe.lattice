@@ -1,0 +1,5 @@
+import add_five from 'dep_b.lattice';
+
+external function main() {
+    return add_five(10);
+}

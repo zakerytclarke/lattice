@@ -24,6 +24,7 @@ class TypeDecl(ASTNode):
         self.fields = fields      # list of (name, type)
         self.invariants = invariants  # list of expression ASTs
         self.is_union = False
+        self.is_external = False
 
 class UnionTypeDecl(ASTNode):
     def __init__(self, name, generics, variants, line):
@@ -32,6 +33,7 @@ class UnionTypeDecl(ASTNode):
         self.generics = generics
         self.variants = variants  # list of TypeExprs
         self.is_union = True
+        self.is_external = False
 
 class FuncDecl(ASTNode):
     def __init__(self, kind, name, generics, params, ret_type, constraints, body, line):
@@ -43,6 +45,12 @@ class FuncDecl(ASTNode):
         self.ret_type = ret_type  # TypeExpr or None
         self.constraints = constraints  # list of expressions (for server functions/termination)
         self.body = body          # list of statements
+
+class ImportDecl(ASTNode):
+    def __init__(self, symbols, module_name, line):
+        super().__init__(line)
+        self.symbols = symbols      # list of str, or '*'
+        self.module_name = module_name  # str
 
 class Param(ASTNode):
     def __init__(self, name, type_expr, line):
@@ -166,7 +174,7 @@ class ListLiteral(ASTNode):
 TOKEN_SPEC = [
     ('COMMENT',   r'//.*'),
     ('NUMBER',    r'\d+'),
-    ('STRING',    r'"[^"]*"'),
+    ('STRING',    r'"[^"]*"|\'[^\']{2,}\'|\'\''),
     ('CHAR',      r"'[^']'"),
     ('ARROW',     r'->'),
     ('DOUBLE_DOT',r'\.\.'),
@@ -264,20 +272,57 @@ class Parser:
         if not t:
             raise SyntaxError("Unexpected EOF while parsing declaration")
         
-        # 1. Type Declaration
-        if t.type == 'ID' and t.value == 'type':
-            return self.parse_type_declaration()
-        
-        # 2. Function Declaration
+        # 1. Check for import
+        if t.type == 'ID' and t.value == 'import':
+            return self.parse_import_declaration()
+            
+        # 2. Check for optional external or server modifier
         is_external = self.match_val('ID', 'external')
         is_server = self.match_val('ID', 'server')
         
-        if self.peek() and self.peek().type == 'ID' and self.peek().value == 'function':
+        # 3. Check for type or function declaration
+        t2 = self.peek()
+        if not t2:
+            raise SyntaxError("Unexpected EOF while parsing declaration")
+            
+        if t2.type == 'ID' and t2.value == 'type':
+            type_decl = self.parse_type_declaration()
+            type_decl.is_external = (is_external is not None)
+            return type_decl
+            
+        if t2.type == 'ID' and t2.value == 'function':
             self.consume('ID') # consume 'function'
             kind = 'external' if is_external else ('server' if is_server else 'normal')
             return self.parse_func_declaration(kind)
-        
+            
         raise SyntaxError(f"Expected declaration (type or function) at line {t.line}")
+
+    def parse_import_declaration(self):
+        line = self.consume('ID').line # import
+        
+        # Parse symbols to import
+        symbols = []
+        if self.match_val('OP', '*'):
+            symbols = '*'
+        else:
+            # Parse identifier or list of comma-separated identifiers
+            while True:
+                symbols.append(self.consume('ID').value)
+                if not self.match('COMMA'):
+                    break
+                    
+        self.consume('ID', "expected 'from'") # from
+        
+        # Parse module name (can be a string literal or ID)
+        t = self.peek()
+        if t and t.type == 'STRING':
+            module_name = self.consume('STRING').value
+        else:
+            module_name = self.consume('ID').value
+            
+        self.match_val('SEMICOLON', ';') # optional semicolon
+        
+        return ImportDecl(symbols, module_name, line)
 
     def parse_type_declaration(self):
         line = self.consume('ID').line # type
@@ -441,7 +486,8 @@ class Parser:
             
         constraint = None
         constraint_var = None
-        if self.peek() and self.peek().type == 'LBRACE' and len(args) == 1 and isinstance(args[0], TypeExpr) and len(args[0].args) == 0:
+        was_paren = (self.pos - 1 >= 0 and self.tokens[self.pos - 1].type == 'RPAREN')
+        if self.peek() and self.peek().type == 'LBRACE' and was_paren and len(args) == 1 and isinstance(args[0], TypeExpr) and len(args[0].args) == 0:
             constraint_var = args[0].name
             args = []
             self.consume('LBRACE')
@@ -622,6 +668,23 @@ class Parser:
             expr = BinaryExpr(op, expr, right, expr.line)
         return expr
 
+    def is_generic_call(self):
+        depth = 0
+        pos = self.pos
+        while pos < len(self.tokens):
+            t = self.tokens[pos]
+            if t.type == 'LBRACKET':
+                depth += 1
+            elif t.type == 'RBRACKET':
+                depth -= 1
+                if depth == 0:
+                    # Check if next token is LPAREN
+                    if pos + 1 < len(self.tokens) and self.tokens[pos + 1].type == 'LPAREN':
+                        return True
+                    return False
+            pos += 1
+        return False
+
     def parse_primary_postfix(self):
         expr = self.parse_primary()
         while True:
@@ -629,13 +692,8 @@ class Parser:
             if self.match_val('OP', '.'):
                 field = self.consume('ID').value
                 expr = FieldExpr(expr, field, expr.line)
-            # Array index: expr[index]
-            elif self.match('LBRACKET'):
-                index = self.parse_expr()
-                self.consume('RBRACKET')
-                expr = IndexExpr(expr, index, expr.line)
-            # Function Call: expr(...) or explicit generic function Call: expr[4](...)
-            elif self.peek() and self.peek().type == 'LBRACKET' and self.peek(1) and self.peek(1).type in ['NUMBER', 'ID']:
+            # Function Call: explicit generic function Call: expr[4](...)
+            elif self.peek() and self.peek().type == 'LBRACKET' and self.is_generic_call():
                 # Generic call insert[4](...)
                 self.consume('LBRACKET')
                 g_args = []
@@ -656,6 +714,11 @@ class Parser:
                             break
                 self.consume('RPAREN')
                 expr = CallExpr(expr, args, g_args, expr.line)
+            # Array index: expr[index]
+            elif self.match('LBRACKET'):
+                index = self.parse_expr()
+                self.consume('RBRACKET')
+                expr = IndexExpr(expr, index, expr.line)
             elif self.match('LPAREN'):
                 args = []
                 if not self.peek() or self.peek().type != 'RPAREN':

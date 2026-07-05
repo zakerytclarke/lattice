@@ -1,0 +1,1 @@
+import * from 'main_imported_dep.lattice';

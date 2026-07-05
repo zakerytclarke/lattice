@@ -1,0 +1,6 @@
+external function main() {
+    print_char('A');
+    let msg: String[12] = String(12, List(['H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', '!']));
+    print_string(msg);
+    return 0;
+}

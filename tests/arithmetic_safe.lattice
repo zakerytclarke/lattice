@@ -1,0 +1,22 @@
+function add_safe(a: Integer(x){x >= 0 && x <= 50}, b: Integer(y){y >= 0 && y <= 50}) -> Integer(z){z >= 0 && z <= 100} {
+    return a + b;
+}
+
+function div_safe(a: Rational, b: Rational(x){x.Numerator != 0}) -> Rational {
+    return div(a, b);
+}
+
+function mixed_math(a: Integer, b: Rational) -> Rational {
+    return add(Rational(a, 1), b);
+}
+
+external function main(a, num, den) {
+    if (a < 0 || a > 50 || num < 0 || num > 50 || den <= 0 || den > 50) {
+        return 0;
+    } else {
+        const sum = add_safe(a, num);
+        const rat = Rational(num, den);
+        const mixed = mixed_math(a, rat);
+        return sum;
+    }
+}

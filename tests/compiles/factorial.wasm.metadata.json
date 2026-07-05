@@ -1,9 +1,0 @@
-[
-  {
-    "name": "n",
-    "kind": "typedef",
-    "type_name": "PositiveInteger",
-    "constraint_var": "value",
-    "constraint_str": "(value > 0)"
-  }
-]

@@ -1,0 +1,13 @@
+function factorial_incorrect_types(n: Integer) -> Integer { 
+    if (n == 1) { // Unbounded lower bound on type as we don't prohibit negative integers
+        return 1;
+    } else {
+        return n * factorial_incorrect_types(n-1); 
+    }
+}
+
+
+
+external function main(n) {
+    return factorial_incorrect_types(n);
+}

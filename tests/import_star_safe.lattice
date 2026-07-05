@@ -1,0 +1,8 @@
+import * from 'math_utils.lattice';
+
+external function main() {
+    let f1: Fraction = Fraction(3, 4);
+    let f2: Fraction = Fraction(1, 3);
+    let res: Fraction = multiply_frac(f1, f2);
+    return res.num;
+}

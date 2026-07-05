@@ -1,6 +1,142 @@
 [
-    {
-        "file": "factorial.lattice",
-        "test_cases"
-    }
+  {
+    "file": "factorial.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [1],
+        "expected": 1
+      },
+      {
+        "args": [5],
+        "expected": 120
+      },
+      {
+        "args": [10],
+        "expected": 3628800
+      }
+    ]
+  },
+  {
+    "file": "factorial_incorrect_termination.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "factorial_incorrect_types.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "arithmetic_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [10, 20, 2],
+        "expected": 30
+      }
+    ]
+  },
+  {
+    "file": "arithmetic_unsafe_bounds.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "arithmetic_unsafe_div.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "list_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [42],
+        "expected": 42
+      }
+    ]
+  },
+  {
+    "file": "list_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "option_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [42],
+        "expected": 142
+      }
+    ]
+  },
+  {
+    "file": "option_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "string_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": 0
+      }
+    ]
+  },
+  {
+    "file": "string_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "io_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": "AHello world!0"
+      }
+    ]
+  },
+  {
+    "file": "io_advanced_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": "Hello, File!\n1"
+      }
+    ]
+  },
+  {
+    "file": "import_test_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": 2
+      }
+    ]
+  },
+  {
+    "file": "import_test_unsafe_internal.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "import_test_unsafe_type.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "redefinition_func.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "redefinition_stdlib.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "main_not_external.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "main_imported.lattice",
+    "should_fail": true
+  }
 ]

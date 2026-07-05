@@ -1,0 +1,5 @@
+import add_three from 'dep_c.lattice';
+
+external function add_five(n: Integer) -> Integer {
+    return add_three(n) + 2;
+}

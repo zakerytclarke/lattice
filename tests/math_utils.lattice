@@ -1,0 +1,11 @@
+external type Fraction(num: Integer, den: Integer) {
+    den != 0
+}
+
+external function multiply_frac(a: Fraction, b: Fraction) -> Fraction {
+    return Fraction(a.num * b.num, a.den * b.den);
+}
+
+function internal_helper() -> Integer {
+    return 42;
+}

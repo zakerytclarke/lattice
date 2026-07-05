@@ -1,0 +1,11 @@
+function factorial(n: Integer(x){x > 0}) -> Integer {
+    if (n == 1) {
+        return 1;
+    } else {
+        return n * factorial(n-1);
+    }
+}
+
+external function main(n) {
+    return factorial(n);
+}

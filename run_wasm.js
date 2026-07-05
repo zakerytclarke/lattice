@@ -1,84 +1,218 @@
 // Node.js WebAssembly Instantiation and Runner
 
-const fs = require('fs');
-
-if (process.argv.length < 3) {
-    console.log("Usage: node run_wasm.js <compiled_file.wasm> [args...]");
-    process.exit(1);
-}
-
-const wasmPath = process.argv[2];
-if (!fs.existsSync(wasmPath)) {
-    console.error(`Error: WebAssembly binary file '${wasmPath}' not found`);
-    process.exit(1);
-}
-
-const wasmBuffer = fs.readFileSync(wasmPath);
-
-// Define environment imports matching the ones declared in the emitter
-const imports = {
-    env: {
-        print_int: function(val) {
-            console.log("Print output:", val);
-        }
+(async () => {
+    let fs, cp;
+    if (typeof require !== 'undefined') {
+        fs = require('fs');
+        cp = require('child_process');
+    } else {
+        fs = await import('fs');
+        cp = await import('child_process');
     }
-};
 
-WebAssembly.instantiate(wasmBuffer, imports).then(result => {
-    const exports = result.instance.exports;
-    
-    if (exports.main) {
-        const args = process.argv.slice(3).map(Number);
-        
-        const metadataPath = wasmPath + ".metadata.json";
-        if (fs.existsSync(metadataPath)) {
-            const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-            for (let i = 0; i < metadata.length; i++) {
-                const param = metadata[i];
-                if (i < args.length) {
-                    const argVal = args[i];
-                    if (param.kind === "typedef" || param.kind === "inline") {
-                        const checkCode = `(function() {
-                            var ${param.constraint_var} = ${argVal};
-                            return ${param.constraint_str};
-                        })()`;
-                        try {
-                            const passed = eval(checkCode);
-                            if (!passed) {
-                                if (param.kind === "typedef") {
-                                    console.error(`expected ${param.name} to be a ${param.type_name}`);
-                                } else {
-                                    let constraintStr = param.constraint_str;
-                                    if (constraintStr.startsWith('(') && constraintStr.endsWith(')')) {
-                                        constraintStr = constraintStr.slice(1, -1);
-                                    }
-                                    console.error(`expected ${param.name} to be of type ${param.base_type}(${param.constraint_var}) where ${constraintStr}`);
-                                }
-                                process.exit(1);
-                            }
-                        } catch (e) {
-                            // fallback
-                        }
+    if (process.argv.length < 3) {
+        console.log("Usage: node run_wasm.js <compiled_file.wasm> [args...]");
+        process.exit(1);
+    }
+
+    const wasmPath = process.argv[2];
+    if (!fs.existsSync(wasmPath)) {
+        console.error(`Error: WebAssembly binary file '${wasmPath}' not found`);
+        process.exit(1);
+    }
+
+    const wasmBuffer = fs.readFileSync(wasmPath);
+
+    let exports;
+    let heapPtr = 50000; // Safe start of temp heap for runtime allocations
+    function allocate(size) {
+        const addr = heapPtr;
+        heapPtr += size;
+        return addr;
+    }
+
+    // Define environment imports matching the ones declared in the emitter
+    const imports = {
+        env: {
+            print_int: function(val) {
+                console.log(val);
+            },
+            print_char: function(val) {
+                process.stdout.write(String.fromCodePoint(val));
+            },
+            print_raw_string: function(addr, len) {
+                const view = new DataView(exports.memory.buffer);
+                let s = "";
+                for (let i = 0; i < len; i++) {
+                    s += String.fromCodePoint(view.getInt32(addr + i * 4, true));
+                }
+                process.stdout.write(s);
+            },
+            read_int_raw: function(out_ptr) {
+                const buffer = Buffer.alloc(1024);
+                let bytesRead = 0;
+                try {
+                    bytesRead = fs.readSync(0, buffer, 0, 1024, null);
+                } catch (e) {}
+                const mem = new Uint8Array(exports.memory.buffer);
+                const view = new DataView(exports.memory.buffer);
+                if (bytesRead === 0) {
+                    mem[out_ptr] = 1; // None (tag 1)
+                    return;
+                }
+                const line = buffer.toString('utf8', 0, bytesRead).trim();
+                const val = parseInt(line, 10);
+                if (isNaN(val)) {
+                    mem[out_ptr] = 1; // None (tag 1)
+                } else {
+                    mem[out_ptr] = 0; // Some (tag 0)
+                    view.setInt32(out_ptr + 1, val, true);
+                }
+            },
+            read_string_raw: function(out_ptr, max_len) {
+                const buffer = Buffer.alloc(1024);
+                let bytesRead = 0;
+                try {
+                    bytesRead = fs.readSync(0, buffer, 0, 1024, null);
+                } catch (e) {}
+                const mem = new Uint8Array(exports.memory.buffer);
+                const view = new DataView(exports.memory.buffer);
+                if (bytesRead === 0) {
+                    mem[out_ptr] = 1; // None (tag 1)
+                    return;
+                }
+                const line = buffer.toString('utf8', 0, bytesRead).replace(/\r?\n$/, "");
+                const finalLen = Math.min(line.length, max_len);
+                
+                // Write Union tag (Some = 0)
+                mem[out_ptr] = 0;
+                
+                // Allocate String struct, List struct, and characters
+                const string_ptr = allocate(8); // len (4 bytes) + data (4 bytes)
+                const list_ptr = allocate(4);   // data (4 bytes)
+                const char_data_ptr = allocate(max_len * 4);
+                
+                // Write String pointer to Some variant Value field
+                view.setInt32(out_ptr + 1, string_ptr, true);
+                // Write len to String len field
+                view.setInt32(string_ptr, finalLen, true);
+                // Write List pointer to String data field
+                view.setInt32(string_ptr + 4, list_ptr, true);
+                // Write Group pointer to List data field
+                view.setInt32(list_ptr, char_data_ptr, true);
+                
+                // Write character code points
+                for (let i = 0; i < finalLen; i++) {
+                    view.setInt32(char_data_ptr + i * 4, line.codePointAt(i), true);
+                }
+            },
+            read_file_raw: function(path_ptr, path_len, out_ptr, max_len) {
+                const view = new DataView(exports.memory.buffer);
+                const list_ptr = view.getInt32(path_ptr + 4, true);
+                const char_data_ptr = view.getInt32(list_ptr, true);
+                let path = "";
+                for (let i = 0; i < path_len; i++) {
+                    path += String.fromCodePoint(view.getInt32(char_data_ptr + i * 4, true));
+                }
+                const mem = new Uint8Array(exports.memory.buffer);
+                try {
+                    if (!fs.existsSync(path)) {
+                        mem[out_ptr] = 1; // None (tag 1)
+                        return;
                     }
+                    const content = fs.readFileSync(path, 'utf8');
+                    const finalLen = Math.min(content.length, max_len);
+                    
+                    // Write Union tag (Some = 0)
+                    mem[out_ptr] = 0;
+                    
+                    // Allocate String struct, List struct, and characters
+                    const out_string_ptr = allocate(8);
+                    const out_list_ptr = allocate(4);
+                    const out_char_data_ptr = allocate(max_len * 4);
+                    
+                    // Write String pointer to Some variant Value field
+                    view.setInt32(out_ptr + 1, out_string_ptr, true);
+                    // Write len to String len field
+                    view.setInt32(out_string_ptr, finalLen, true);
+                    // Write List pointer to String data field
+                    view.setInt32(out_string_ptr + 4, out_list_ptr, true);
+                    // Write Group pointer to List data field
+                    view.setInt32(out_list_ptr, out_char_data_ptr, true);
+                    
+                    // Write character code points
+                    for (let i = 0; i < finalLen; i++) {
+                        view.setInt32(out_char_data_ptr + i * 4, content.codePointAt(i), true);
+                    }
+                } catch (e) {
+                    mem[out_ptr] = 1; // None (tag 1)
+                }
+            },
+            http_get_raw: function(url_ptr, url_len, out_ptr, max_len) {
+                const view = new DataView(exports.memory.buffer);
+                const list_ptr = view.getInt32(url_ptr + 4, true);
+                const char_data_ptr = view.getInt32(list_ptr, true);
+                let url = "";
+                for (let i = 0; i < url_len; i++) {
+                    url += String.fromCodePoint(view.getInt32(char_data_ptr + i * 4, true));
+                }
+                const mem = new Uint8Array(exports.memory.buffer);
+                try {
+                    const content = cp.execSync(`curl -s "${url}"`, { encoding: 'utf8', timeout: 5000 });
+                    const finalLen = Math.min(content.length, max_len);
+                    
+                    // Write Union tag (Some = 0)
+                    mem[out_ptr] = 0;
+                    
+                    // Allocate String struct, List struct, and characters
+                    const out_string_ptr = allocate(8);
+                    const out_list_ptr = allocate(4);
+                    const out_char_data_ptr = allocate(max_len * 4);
+                    
+                    // Write String pointer to Some variant Value field
+                    view.setInt32(out_ptr + 1, out_string_ptr, true);
+                    // Write len to String len field
+                    view.setInt32(out_string_ptr, finalLen, true);
+                    // Write List pointer to String data field
+                    view.setInt32(out_string_ptr + 4, out_list_ptr, true);
+                    // Write Group pointer to List data field
+                    view.setInt32(out_list_ptr, out_char_data_ptr, true);
+                    
+                    // Write character code points
+                    for (let i = 0; i < finalLen; i++) {
+                        view.setInt32(out_char_data_ptr + i * 4, content.codePointAt(i), true);
+                    }
+                } catch (e) {
+                    mem[out_ptr] = 1; // None (tag 1)
                 }
             }
         }
+    };
+
+    try {
+        const result = await WebAssembly.instantiate(wasmBuffer, imports);
+        exports = result.instance.exports;
         
-        console.log(`Running main(...) with arguments: [${args.join(', ')}]`);
-        const start = Date.now();
-        const ret = exports.main(...args);
-        const elapsed = Date.now() - start;
-        console.log(`Execution return value: ${ret} (completed in ${elapsed}ms)`);
-    } else if (exports.app_entry) {
-        console.log("Running app_entry()...");
-        const start = Date.now();
-        exports.app_entry();
-        const elapsed = Date.now() - start;
-        console.log(`Execution finished (completed in ${elapsed}ms)`);
-    } else {
-        console.log("WASM loaded, but found no entry point 'main' or 'app_entry'.");
+        if (exports.main) {
+            const args = process.argv.slice(3).map(Number);
+            
+
+            
+            const ret = exports.main(...args);
+            if (ret !== undefined) {
+                console.log(ret);
+            }
+        } else if (exports.app_entry) {
+            console.log("Running app_entry()...");
+            const start = Date.now();
+            exports.app_entry();
+            const elapsed = Date.now() - start;
+            console.log(`Execution finished (completed in ${elapsed}ms)`);
+        } else {
+            console.log("WASM loaded, but found no entry point 'main' or 'app_entry'.");
+        }
+    } catch (err) {
+        console.error("WebAssembly Instantiation Failed:", err);
+        process.exit(1);
     }
-}).catch(err => {
-    console.error("WebAssembly Instantiation Failed:", err);
-    process.exit(1);
-});
+})();

@@ -1,0 +1,6 @@
+import PrivateType from 'math_utils_internal_type.lattice';
+
+external function main() {
+    let p: PrivateType = PrivateType(10);
+    return 0;
+}

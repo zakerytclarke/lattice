@@ -1,0 +1,8 @@
+function add_unsafe(a: Integer(x){x >= 0 && x <= 50}, b: Integer(y){y >= 0 && y <= 50}) -> Integer(z){z >= 0 && z <= 80} {
+    // Unsafe because a + b can evaluate to 100, exceeding upper bound of 80
+    return a + b;
+}
+
+external function main(a) {
+    return 0;
+}

@@ -1,0 +1,10 @@
+function get_value_unsafe(opt: Input[Integer]) -> Integer {
+    match (opt) {
+        Some(val) => { return val; }
+    }
+}
+
+external function main(val) {
+    let opt_some: Input[Integer] = Some(val);
+    return get_value_unsafe(opt_some);
+}

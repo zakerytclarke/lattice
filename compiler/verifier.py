@@ -34,7 +34,12 @@ class SMTVerifier:
             var = self.get_z3_var(name, resolved_type.base_type)
             if resolved_type.constraint is not None:
                 local_var_map = {resolved_type.constraint_var: var}
-                z3_constraint = self.translate_expr(resolved_type.constraint, local_var_map=local_var_map)
+                local_type_map = {resolved_type.constraint_var: resolved_type.base_type}
+                z3_constraint = self.translate_expr(
+                    resolved_type.constraint, 
+                    local_var_map=local_var_map, 
+                    local_type_map=local_type_map
+                )
                 if z3_constraint is not None:
                     self.solver.add(z3_constraint)
             return var
@@ -57,7 +62,10 @@ class SMTVerifier:
                 fields_vars[fname] = fvar
                 fields_tuple.append(fvar)
             
-            val = tuple(fields_tuple) if len(fields_tuple) > 1 else fields_tuple[0]
+            if len(fields_tuple) == 0:
+                val = z3.Int(name)
+            else:
+                val = tuple(fields_tuple) if len(fields_tuple) > 1 else fields_tuple[0]
             self.variables[name] = val
             
             if resolved_type.name == 'Rational':
@@ -65,18 +73,23 @@ class SMTVerifier:
                 
             if resolved_type.invariants:
                 for inv in resolved_type.invariants:
-                    z3_inv = self.translate_expr(inv, local_var_map=fields_vars)
+                    z3_inv = self.translate_expr(
+                        inv, 
+                        generic_map=getattr(resolved_type, 'generic_map', None), 
+                        local_var_map=fields_vars
+                    )
                     if z3_inv is not None:
                         self.solver.add(z3_inv)
             return val
             
         return None
 
-    def translate_expr(self, expr, generic_map=None, local_var_map=None):
+    def translate_expr(self, expr, generic_map=None, local_var_map=None, local_type_map=None):
         if not self.solver:
             return None
-        generic_map = generic_map or {}
+        generic_map = generic_map or self.resolver.current_generic_map
         local_var_map = local_var_map or {}
+        local_type_map = local_type_map or {}
         
         if isinstance(expr, Literal):
             if expr.val_type == 'Integer':
@@ -103,8 +116,8 @@ class SMTVerifier:
             return z3.Int(expr.name)
 
         if isinstance(expr, BinaryExpr):
-            left = self.translate_expr(expr.left, generic_map, local_var_map)
-            right = self.translate_expr(expr.right, generic_map, local_var_map)
+            left = self.translate_expr(expr.left, generic_map, local_var_map, local_type_map)
+            right = self.translate_expr(expr.right, generic_map, local_var_map, local_type_map)
             if left is None or right is None:
                 return None
                 
@@ -123,9 +136,17 @@ class SMTVerifier:
             if expr.op == '||': return z3.Or(left, right)
 
         if isinstance(expr, FieldExpr):
-            base = self.translate_expr(expr.expr, generic_map, local_var_map)
+            base = self.translate_expr(expr.expr, generic_map, local_var_map, local_type_map)
             if base is not None:
-                struct_t = self.resolver.infer_expr_type(expr.expr)
+                struct_t = None
+                if isinstance(expr.expr, Identifier) and expr.expr.name in local_type_map:
+                    struct_t = local_type_map[expr.expr.name]
+                else:
+                    try:
+                        struct_t = self.resolver.infer_expr_type(expr.expr)
+                    except Exception:
+                        pass
+                
                 if isinstance(struct_t, RefinedResolvedType):
                     struct_t = struct_t.base_type
                 if isinstance(struct_t, StructResolvedType):
@@ -135,6 +156,18 @@ class SMTVerifier:
                                 return base[idx]
                             return base
                     
+        if isinstance(expr, CallExpr):
+            if isinstance(expr.func, Identifier) and (expr.func.name in self.resolver.type_decls or expr.func.name in self.resolver.types):
+                args_z3 = [self.translate_expr(arg, generic_map, local_var_map, local_type_map) for arg in expr.args]
+                if any(a is None for a in args_z3):
+                    return None
+                if len(args_z3) == 0:
+                    return z3.Int(f"null_constructor_{id(expr)}")
+                return tuple(args_z3) if len(args_z3) > 1 else args_z3[0]
+                
+        if isinstance(expr, ListLiteral):
+            return z3.Int(f"list_lit_{id(expr)}")
+            
         return None
 
     def assert_constraint(self, expr, generic_map=None):
@@ -178,11 +211,29 @@ class SMTVerifier:
         if not self.solver:
             return
         self.current_func_name = func.name
+        
+        # Build local generic map for function's own generic parameters
+        local_generic_map = {}
+        if func.generics:
+            for gname, gtype_expr in func.generics:
+                gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
+                if gtype_name == 'Type':
+                    local_generic_map[gname] = self.resolver.types['Integer']
+                else:
+                    local_generic_map[gname] = 100
+        self.resolver.current_generic_map = local_generic_map
+        
         self.resolver.locals = self.resolver.func_locals[func.name]
         self.solver.push()
         
         # 1. Reset variable mappings for Z3
         self.variables = {}
+        
+        # Pre-populate parameters at root level
+        for param in func.params:
+            param_t = self.resolver.resolve_type_expr(param.type_expr)
+            if param_t:
+                self.get_z3_var(param.name, param_t)
         
         # 2. Assert server validation constraints / preconditions
         for constraint in func.constraints:
@@ -193,9 +244,12 @@ class SMTVerifier:
             self.verify_statement(stmt)
             
         self.solver.pop()
+        self.resolver.current_generic_map = {}
 
     def verify_statement(self, stmt):
         if isinstance(stmt, VarDecl):
+            # Verify expression contents first
+            self.verify_expr_safety(stmt.value, stmt.line)
             # Assert variable equality if it can be represented
             z3_var = self.get_z3_var(stmt.name, self.resolver.locals[stmt.name][0])
             z3_val = self.translate_expr(stmt.value)
@@ -203,12 +257,10 @@ class SMTVerifier:
                 # If Rational, match fields
                 if isinstance(z3_var, tuple):
                     if isinstance(z3_val, tuple):
-                        self.solver.add(z3_var[0] == z3_val[0])
-                        self.solver.add(z3_var[1] == z3_val[1])
+                        for idx_tuple in range(min(len(z3_var), len(z3_val))):
+                            self.solver.add(z3_var[idx_tuple] == z3_val[idx_tuple])
                 else:
                     self.solver.add(z3_var == z3_val)
-            # Verify expression contents
-            self.verify_expr_safety(stmt.value, stmt.line)
             
         elif isinstance(stmt, Assign):
             # If target is indexing or field, check safety
@@ -282,6 +334,32 @@ class SMTVerifier:
         elif isinstance(stmt, ReturnStmt):
             if stmt.expr:
                 self.verify_expr_safety(stmt.expr, stmt.line)
+                
+                # Check return type constraint
+                func_decl = self.resolver.functions[self.current_func_name]
+                if func_decl.ret_type:
+                    ret_t = self.resolver.resolve_type_expr(func_decl.ret_type)
+                    if isinstance(ret_t, IOResolvedType):
+                        ret_t = ret_t.inner
+                    if isinstance(ret_t, RefinedResolvedType):
+                        z3_ret = self.translate_expr(stmt.expr)
+                        if z3_ret is not None:
+                            z3_constraint = self.translate_expr(
+                                ret_t.constraint, 
+                                local_var_map={ret_t.constraint_var: z3_ret},
+                                local_type_map={ret_t.constraint_var: ret_t.base_type}
+                            )
+                            if z3_constraint is not None:
+                                self.solver.push()
+                                self.solver.add(z3.Not(z3_constraint))
+                                res = self.solver.check()
+                                self.solver.pop()
+                                if res == z3.sat:
+                                    raise SafetyError(
+                                        f"Return value constraint verification failed: "
+                                        f"expected return value to satisfy constraint of return type '{ret_t}'", 
+                                        stmt.line
+                                    )
                 
         elif isinstance(stmt, ExprStmt):
             self.verify_expr_safety(stmt.expr, stmt.line)
@@ -397,6 +475,88 @@ class SMTVerifier:
                 self.verify_expr_safety(arg, line)
                 
             func_name = expr.func.name
+            
+            # 1. Parameter constraint verification for normal function calls at call site
+            if func_name in self.resolver.functions:
+                callee_decl = self.resolver.functions[func_name]
+                call_generic_map = {}
+                if callee_decl.generics:
+                    for gname, _ in callee_decl.generics:
+                        call_generic_map[gname] = None
+                    if expr.generic_args:
+                        for i, (gname, _) in enumerate(callee_decl.generics):
+                            if i < len(expr.generic_args):
+                                call_generic_map[gname] = expr.generic_args[i]
+                    else:
+                        for idx, arg in enumerate(expr.args):
+                            if idx < len(callee_decl.params):
+                                arg_t = self.resolver.infer_expr_type(arg)
+                                self.resolver.infer_call_generics(callee_decl.params[idx].type_expr, arg_t, call_generic_map)
+                                
+                    for gname, gtype_expr in callee_decl.generics:
+                        if call_generic_map[gname] is None:
+                            gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
+                            if gtype_name == 'Type':
+                                call_generic_map[gname] = self.resolver.types['Integer']
+                            else:
+                                call_generic_map[gname] = 100
+                                
+                for idx, param in enumerate(callee_decl.params):
+                    if idx < len(expr.args):
+                        param_t = self.resolver.resolve_type_expr(param.type_expr, call_generic_map)
+                        if isinstance(param_t, RefinedResolvedType):
+                            z3_arg = self.translate_expr(expr.args[idx])
+                            if z3_arg is not None:
+                                z3_constraint = self.translate_expr(
+                                    param_t.constraint, 
+                                    generic_map=call_generic_map,
+                                    local_var_map={param_t.constraint_var: z3_arg},
+                                    local_type_map={param_t.constraint_var: param_t.base_type}
+                                )
+                                if z3_constraint is not None:
+                                    self.solver.push()
+                                    self.solver.add(z3.Not(z3_constraint))
+                                    res = self.solver.check()
+                                    self.solver.pop()
+                                    if res == z3.sat:
+                                        raise SafetyError(
+                                            f"Argument constraint verification failed for call to '{func_name}': "
+                                            f"expected argument {idx} to satisfy constraint of parameter '{param.name}'", 
+                                            line
+                                        )
+                                        
+                if callee_decl.constraints:
+                    pre_var_map = {}
+                    pre_type_map = {}
+                    for idx, param in enumerate(callee_decl.params):
+                        if idx < len(expr.args):
+                            z3_arg = self.translate_expr(expr.args[idx])
+                            if z3_arg is not None:
+                                pre_var_map[param.name] = z3_arg
+                                param_t = self.resolver.resolve_type_expr(param.type_expr, call_generic_map)
+                                if param_t:
+                                    pre_type_map[param.name] = param_t.base_type if isinstance(param_t, RefinedResolvedType) else param_t
+                                    
+                    for constraint in callee_decl.constraints:
+                        z3_pre = self.translate_expr(
+                            constraint, 
+                            generic_map=call_generic_map,
+                            local_var_map=pre_var_map,
+                            local_type_map=pre_type_map
+                        )
+                        if z3_pre is not None:
+                            self.solver.push()
+                            self.solver.add(z3.Not(z3_pre))
+                            res = self.solver.check()
+                            self.solver.pop()
+                            if res == z3.sat:
+                                raise SafetyError(
+                                    f"Precondition verification failed for call to '{func_name}': "
+                                    f"could not prove constraint '{constraint}'", 
+                                    line
+                                )
+                                        
+            # 2. Recursive call termination checks
             if func_name == self.current_func_name:
                 func_decl = self.resolver.functions[func_name]
                 decrease_proven = False
@@ -412,8 +572,14 @@ class SMTVerifier:
                             res = self.solver.check()
                             self.solver.pop()
                             if res == z3.unsat:
-                                decrease_proven = True
-                                break
+                                # Also check if the argument is bounded below (e.g. z3_arg >= 0)
+                                self.solver.push()
+                                self.solver.add(z3_arg < 0)
+                                bound_res = self.solver.check()
+                                self.solver.pop()
+                                if bound_res == z3.unsat:
+                                    decrease_proven = True
+                                    break
                         
                         try:
                             val = self.resolver.evaluate_constant(expr.args[idx])
@@ -432,7 +598,11 @@ class SMTVerifier:
                     if struct_t.constraint is not None and len(expr.args) == 1:
                         z3_arg = self.translate_expr(expr.args[0])
                         if z3_arg is not None:
-                            z3_constraint = self.translate_expr(struct_t.constraint, local_var_map={struct_t.constraint_var: z3_arg})
+                            z3_constraint = self.translate_expr(
+                                struct_t.constraint, 
+                                local_var_map={struct_t.constraint_var: z3_arg},
+                                local_type_map={struct_t.constraint_var: struct_t.base_type}
+                            )
                             if z3_constraint is not None:
                                 self.solver.push()
                                 self.solver.add(z3.Not(z3_constraint))
@@ -451,7 +621,11 @@ class SMTVerifier:
                                     fields_map[fname] = z3_arg
                                     
                         for inv in struct_t.invariants:
-                            z3_inv = self.translate_expr(inv, local_var_map=fields_map)
+                            z3_inv = self.translate_expr(
+                                inv, 
+                                generic_map=getattr(struct_t, 'generic_map', None), 
+                                local_var_map=fields_map
+                            )
                             if z3_inv is not None:
                                 self.solver.push()
                                 self.solver.add(z3.Not(z3_inv))

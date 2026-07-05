@@ -1,0 +1,8 @@
+function div_unsafe(a: Rational, b: Rational) -> Rational {
+    // Unsafe because b.Numerator could be 0, violating precondition of stdlib div function
+    return div(a, b);
+}
+
+external function main(a) {
+    return 0;
+}

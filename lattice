@@ -11,10 +11,12 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 1. Compile source to WASM
-# We use a temporary wasm file inside the workspace
-WASM_TEMP="$SCRIPT_DIR/temp_compilation_output.wasm"
+# We compile to the build/ directory
+FILENAME=$(basename "$1")
+BASENAME="${FILENAME%.*}"
+WASM_OUT="$SCRIPT_DIR/build/$BASENAME.wasm"
 
-python3 "$SCRIPT_DIR/compiler/main.py" "$1" "$WASM_TEMP"
+python3 "$SCRIPT_DIR/compiler/main.py" "$1" "$WASM_OUT"
 COMPILE_STATUS=$?
 
 if [ $COMPILE_STATUS -ne 0 ]; then
@@ -22,7 +24,7 @@ if [ $COMPILE_STATUS -ne 0 ]; then
 fi
 
 # 2. Run the compiled WASM
-node "$SCRIPT_DIR/run_wasm.js" "$WASM_TEMP" "${@:2}"
+node "$SCRIPT_DIR/run_wasm.js" "$WASM_OUT" "${@:2}"
 EXEC_STATUS=$?
 
 exit $EXEC_STATUS

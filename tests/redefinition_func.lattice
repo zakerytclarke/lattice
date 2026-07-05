@@ -1,0 +1,3 @@
+function duplicate() -> Integer { return 1; }
+function duplicate() -> Integer { return 2; }
+external function main() { return 0; }

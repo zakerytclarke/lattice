@@ -1,9 +1,0 @@
-[
-  {
-    "name": "n",
-    "kind": "inline",
-    "base_type": "Integer",
-    "constraint_var": "x",
-    "constraint_str": "(x > 0)"
-  }
-]
