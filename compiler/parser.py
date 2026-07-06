@@ -3,13 +3,16 @@
 import re
 import sys
 
+from compiler.errors import LatticeSyntaxError
+
 # ============================================================================
 # 1. AST Node Definitions
 # ============================================================================
 
 class ASTNode:
-    def __init__(self, line):
+    def __init__(self, line, column=1):
         self.line = line
+        self.column = column
 
 class Program(ASTNode):
     def __init__(self, decls, line):
@@ -124,6 +127,12 @@ class BinaryExpr(ASTNode):
         self.left = left
         self.right = right
 
+class UnaryExpr(ASTNode):
+    def __init__(self, op, operand, line):
+        super().__init__(line)
+        self.op = op
+        self.operand = operand
+
 class IndexExpr(ASTNode):
     def __init__(self, expr, index, line):
         super().__init__(line)
@@ -144,10 +153,11 @@ class CallExpr(ASTNode):
         self.generic_args = generic_args  # explicit generics, e.g. insert[4](...)
 
 class TypeExpr(ASTNode):
-    def __init__(self, name, args, line, constraint=None, constraint_var=None):
+    def __init__(self, name, args, line, constraint=None, constraint_var=None, size=None):
         super().__init__(line)
         self.name = name          # e.g., 'Integer', 'List'
-        self.args = args          # generic TypeExprs or values
+        self.args = args          # element / inner type parameters from [...]
+        self.size = size          # optional capacity from (...), e.g. List(10)[T]
         self.constraint = constraint
         self.constraint_var = constraint_var
 
@@ -155,11 +165,16 @@ class Literal(ASTNode):
     def __init__(self, value, val_type, line):
         super().__init__(line)
         self.value = value        # int, bool, str, char
-        self.val_type = val_type  # 'Int', 'Bool', 'String', 'Char'
+        self.val_type = val_type  # 'Int', 'Bool', 'Char'
+
+class StringLiteral(ASTNode):
+    def __init__(self, value, line):
+        super().__init__(line)
+        self.value = value
 
 class Identifier(ASTNode):
-    def __init__(self, name, line):
-        super().__init__(line)
+    def __init__(self, name, line, column=1):
+        super().__init__(line, column)
         self.name = name
 
 class ListLiteral(ASTNode):
@@ -179,7 +194,7 @@ TOKEN_SPEC = [
     ('ARROW',     r'->'),
     ('DOUBLE_DOT',r'\.\.'),
     ('FAT_ARROW', r'=>'),
-    ('OP',        r'==|!=|<=|>=|&&|\|\||[+\-*/%=<>&|!.]'),
+    ('OP',        r'==|!=|<=|>=|&&|\|\||[+\-*/%=<>&|!.^]'),
     ('ID',        r'[a-zA-Z_][a-zA-Z0-9_]*'),
     ('LPAREN',    r'\('),
     ('RPAREN',    r'\)'),
@@ -196,12 +211,13 @@ TOKEN_SPEC = [
 ]
 
 class Token:
-    def __init__(self, type, value, line):
+    def __init__(self, type, value, line, column=1):
         self.type = type
         self.value = value
         self.line = line
+        self.column = column
     def __repr__(self):
-        return f"Token({self.type}, {repr(self.value)}, {self.line})"
+        return f"Token({self.type}, {repr(self.value)}, {self.line}:{self.column})"
 
 def tokenize(code):
     tokens = []
@@ -215,13 +231,23 @@ def tokenize(code):
         elif kind == 'SKIP' or kind == 'COMMENT':
             pass
         elif kind == 'MISMATCH':
-            raise SyntaxError(f"Unexpected character {repr(value)} at line {line_num}")
+            line_start = code.rfind('\n', 0, mo.start()) + 1
+            col = mo.start() - line_start + 1
+            err_line = code[:mo.start()].count('\n') + 1
+            raise LatticeSyntaxError(
+                f"unexpected character {repr(value)}",
+                err_line,
+                col,
+            )
         else:
+            line_start = code.rfind('\n', 0, mo.start()) + 1
+            col = mo.start() - line_start + 1
+            err_line = code[:mo.start()].count('\n') + 1
             if kind == 'STRING':
                 value = value[1:-1]
             elif kind == 'CHAR':
                 value = value[1:-1]
-            tokens.append(Token(kind, value, line_num))
+            tokens.append(Token(kind, value, err_line, col))
     return tokens
 
 # ============================================================================
@@ -256,9 +282,16 @@ class Parser:
         t = self.match(expected_type)
         if not t:
             curr = self.peek()
-            line = curr.line if curr else "EOF"
-            val = curr.value if curr else ""
-            raise SyntaxError(f"Parse error at line {line} near '{val}': {msg or f'expected {expected_type}'}")
+            if curr:
+                found = f"'{curr.value}'"
+                column = curr.column
+                line = curr.line
+            else:
+                found = "end of file"
+                column = 1
+                line = self.tokens[-1].line if self.tokens else 1
+            detail = msg or f"expected {expected_type}, found {found}"
+            raise LatticeSyntaxError(detail, line, column)
         return t
 
     def parse_program(self):
@@ -270,7 +303,9 @@ class Parser:
     def parse_declaration(self):
         t = self.peek()
         if not t:
-            raise SyntaxError("Unexpected EOF while parsing declaration")
+            line = self.tokens[-1].line if self.tokens else 1
+            column = self.tokens[-1].column if self.tokens else 1
+            raise LatticeSyntaxError("unexpected end of file while parsing declaration", line, column)
         
         # 1. Check for import
         if t.type == 'ID' and t.value == 'import':
@@ -295,7 +330,11 @@ class Parser:
             kind = 'external' if is_external else ('server' if is_server else 'normal')
             return self.parse_func_declaration(kind)
             
-        raise SyntaxError(f"Expected declaration (type or function) at line {t.line}")
+        raise LatticeSyntaxError(
+            f"expected a type or function declaration, found '{t.value}'",
+            t.line,
+            t.column,
+        )
 
     def parse_import_declaration(self):
         line = self.consume('ID').line # import
@@ -350,7 +389,7 @@ class Parser:
         if self.match_val('OP', '='):
             u_word = self.consume('ID')
             if u_word.value != 'Union':
-                raise SyntaxError(f"Expected 'Union' at line {u_word.line}")
+                raise LatticeSyntaxError("expected 'Union'", u_word.line, u_word.column)
             self.consume('LBRACKET')
             variants = []
             while True:
@@ -458,48 +497,65 @@ class Parser:
 
     def parse_type_expr(self):
         line = self.peek().line if self.peek() else 0
-        
-        # Parse Type Name (could be placeholder '_' or identifier)
+
         tname = "_"
         if self.match_val('ID', '_'):
             tname = "_"
         else:
             tname = self.consume('ID').value
-            
+
+        size = None
         args = []
-        # Support either Name[A, B] or Name(A, B) for parameterized types
-        if self.match('LBRACKET') or self.match('LPAREN'):
-            delim = 'RBRACKET' if self.tokens[self.pos-1].type == 'LBRACKET' else 'RPAREN'
-            while True:
-                # Check if it is a nested TypeExpr or a numeric size constraint
-                if self.peek() and self.peek().type == 'NUMBER':
-                    num = self.consume('NUMBER').value
-                    args.append(Literal(int(num), 'Integer', line))
-                elif self.peek() and self.peek().type == 'ID' and self.peek().value in ['true', 'false']:
-                    val = self.consume('ID').value == 'true'
-                    args.append(Literal(val, 'Bool', line))
-                else:
-                    args.append(self.parse_type_expr())
-                if not self.match('COMMA'):
-                    break
-            self.consume(delim)
-            
         constraint = None
         constraint_var = None
-        was_paren = (self.pos - 1 >= 0 and self.tokens[self.pos - 1].type == 'RPAREN')
-        if self.peek() and self.peek().type == 'LBRACE' and was_paren and len(args) == 1 and isinstance(args[0], TypeExpr) and len(args[0].args) == 0:
-            constraint_var = args[0].name
-            args = []
-            self.consume('LBRACE')
-            constraint = self.parse_expr()
-            self.consume('RBRACE')
-            
-        return TypeExpr(tname, args, line, constraint, constraint_var)
+
+        # Optional capacity: List(10)[T], String(64), Group(N)[Elem]
+        if self.match('LPAREN'):
+            if self.peek() and self.peek().type == 'NUMBER':
+                size = Literal(int(self.consume('NUMBER').value), 'Integer', line)
+                self.consume('RPAREN')
+            elif self.peek() and self.peek().type == 'ID' and self.peek().value in ['true', 'false']:
+                val = self.consume('ID').value == 'true'
+                size = Literal(val, 'Bool', line)
+                self.consume('RPAREN')
+            elif self.peek() and self.peek().type == 'ID':
+                id_name = self.consume('ID').value
+                self.consume('RPAREN')
+                if (
+                    self.peek()
+                    and self.peek().type == 'LBRACE'
+                    and tname not in ('String', 'List', 'Group')
+                ):
+                    constraint_var = id_name
+                    self.consume('LBRACE')
+                    constraint = self.parse_expr()
+                    self.consume('RBRACE')
+                else:
+                    size = TypeExpr(id_name, [], line)
+            else:
+                column = self.peek().column if self.peek() else 1
+                raise LatticeSyntaxError(
+                    f"expected numeric capacity or generic name in type size (...)",
+                    line,
+                    column,
+                )
+
+        # Element / inner type parameters: List[T], Union[A, B], Input[T]
+        if self.match('LBRACKET'):
+            while True:
+                args.append(self.parse_type_expr())
+                if not self.match('COMMA'):
+                    break
+            self.consume('RBRACKET')
+
+        return TypeExpr(tname, args, line, constraint, constraint_var, size)
 
     def parse_statement(self):
         t = self.peek()
         if not t:
-            raise SyntaxError("Unexpected EOF while parsing statement")
+            line = self.tokens[-1].line if self.tokens else 1
+            column = self.tokens[-1].column if self.tokens else 1
+            raise LatticeSyntaxError("unexpected end of file while parsing statement", line, column)
             
         # 1. Local Var Declaration
         if t.type == 'ID' and t.value in ['let', 'const']:
@@ -661,12 +717,22 @@ class Parser:
         return expr
 
     def parse_multiplicative(self):
-        expr = self.parse_primary_postfix()
-        while self.peek() and self.peek().type == 'OP' and self.peek().value in ['*', '/', '%']:
+        expr = self.parse_unary()
+        while self.peek() and self.peek().type == 'OP' and self.peek().value in ['*', '/', '%', '^']:
             op = self.consume('OP').value
-            right = self.parse_primary_postfix()
+            right = self.parse_unary()
             expr = BinaryExpr(op, expr, right, expr.line)
         return expr
+
+    def parse_unary(self):
+        if self.peek() and self.peek().type == 'OP' and self.peek().value == '!':
+            self.consume('OP')
+            operand = self.parse_unary()
+            return UnaryExpr('!', operand, operand.line)
+        if self.match_val('ID', 'not'):
+            operand = self.parse_unary()
+            return UnaryExpr('!', operand, operand.line)
+        return self.parse_primary_postfix()
 
     def is_generic_call(self):
         depth = 0
@@ -735,12 +801,14 @@ class Parser:
     def parse_primary(self):
         t = self.peek()
         if not t:
-            raise SyntaxError("Unexpected EOF while parsing expression")
+            line = self.tokens[-1].line if self.tokens else 1
+            column = self.tokens[-1].column if self.tokens else 1
+            raise LatticeSyntaxError("unexpected end of file while parsing expression", line, column)
             
         if self.match('NUMBER'):
             return Literal(int(self.tokens[self.pos-1].value), 'Integer', t.line)
         if self.match('STRING'):
-            return Literal(self.tokens[self.pos-1].value, 'String', t.line)
+            return StringLiteral(self.tokens[self.pos-1].value, t.line)
         if self.match('CHAR'):
             return Literal(self.tokens[self.pos-1].value, 'Char', t.line)
         if self.match_val('ID', 'true'):
@@ -749,7 +817,8 @@ class Parser:
             return Literal(False, 'Bool', t.line)
             
         if self.match('ID'):
-            return Identifier(self.tokens[self.pos-1].value, t.line)
+            tok = self.tokens[self.pos-1]
+            return Identifier(tok.value, tok.line, tok.column)
             
         # Nested expression ( expr )
         if self.match('LPAREN'):
@@ -768,7 +837,11 @@ class Parser:
             self.consume('RBRACKET')
             return ListLiteral(elements, t.line)
             
-        raise SyntaxError(f"Unexpected token '{t.value}' of type '{t.type}' at line {t.line}")
+        raise LatticeSyntaxError(
+            f"unexpected token '{t.value}' ({t.type})",
+            t.line,
+            t.column,
+        )
 
 # Helper utility to parse source code directly
 def parse_code(code):

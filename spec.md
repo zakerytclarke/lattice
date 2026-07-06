@@ -56,7 +56,7 @@ const y = 10;       // immutable after initialization
 Function parameters can be marked `let` (mutable) or `const` (immutable):
 
 ```lattice
-function set[N: Integer, T: Type](let list: List[N, T], idx: Integer, val: T) -> List[N, T] {
+function set[T: Type, N: Integer](let list: List(N)[T], idx: Integer, val: T) -> List(N)[T] {
     // ...
 }
 ```
@@ -128,19 +128,36 @@ let absent: Input[Integer] = None();
 Type parameters use square brackets with optional kind annotations:
 
 ```lattice
-type List[LenList: Integer, Elem: Type](data: Group[LenList, Elem]) {
+type List[Elem: Type, LenList: Integer](data: Group(LenList)[Elem]) {
     LenList >= 0
 }
 ```
 
-`Group[Len, Elem]` is a compiler builtin representing a fixed-size contiguous buffer. It is used internally by `List` and is not typically referenced directly in user code.
+`Group(Len)[Elem]` is a compiler builtin representing a fixed-size contiguous buffer. It is used internally by `List` and is not typically referenced directly in user code.
 
-### 5.6 `List[N, T]`
+Sized container types separate **element type** from **capacity**:
+
+| Syntax | Meaning |
+|--------|---------|
+| `List[T]` | List of `T` with inferred or unbounded capacity |
+| `List(N)[T]` | Fixed list of `N` elements of type `T` |
+| `String(N)` | String with maximum length `N` |
+| `Group(N)[T]` | Raw fixed buffer of `N` elements of type `T` |
+
+Square brackets `[...]` carry element or inner type parameters. Parentheses `(...)` carry numeric capacity when the compiler needs a fixed size for static memory layout.
+
+### 5.6 `List(N)[T]`
 
 A fixed-capacity array of `N` elements of type `T`:
 
 ```lattice
-let my_list: List[5, Integer] = List([0, 0, 0, 0, 0]);
+let my_list: List(5)[Integer] = List([0, 0, 0, 0, 0]);
+```
+
+When capacity can be inferred (e.g. from a list literal), you may omit it:
+
+```lattice
+let xs: List[Integer] = List([1, 2, 3]);
 ```
 
 Access the backing buffer via `.data`:
@@ -151,20 +168,20 @@ my_list.data[idx]
 
 List literals use square brackets: `[1, 2, 3]`.
 
-### 5.7 `String[MaxLen]`
+### 5.7 `String(N)`
 
-A bounded string with a runtime length no greater than `MaxLen`:
+A bounded string with a runtime length no greater than `N`:
 
 ```lattice
-type String[MaxLen: Integer](len: Integer, data: List[MaxLen, Char]) {
+type String[MaxLen: Integer](len: Integer, data: List(MaxLen)[Char]) {
     len >= 0 && len <= MaxLen
 }
 ```
 
-Construct with length first, then the character list:
+Construct with length first, then the character list, or use a string literal when the type annotation supplies capacity:
 
 ```lattice
-let msg: String[12] = String(12, List(['H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', '!']));
+let msg: String(12) = "Hello world!";
 ```
 
 Access characters through `s.data.data[idx]` after proving `idx < s.len`.
@@ -200,7 +217,7 @@ Return type and parameter types can be omitted when inferable.
 Place constraints between the signature and body. They must hold for the function to be called safely:
 
 ```lattice
-function get[N: Integer, T: Type](list: List[N, T], idx: Integer) -> T {
+function get[T: Type, N: Integer](list: List(N)[T], idx: Integer) -> T {
     idx >= 0 && idx < N;
 } {
     return list.data[idx];
@@ -308,11 +325,11 @@ The standard library is embedded in `compiler/stdlib.py` and loaded automaticall
 | Function | Description |
 |----------|-------------|
 | `print_char(c: Char) -> IO[void]` | Print one character |
-| `print_string(s: String[N]) -> IO[void]` | Print a string |
+| `print_string(s: String(N)) -> IO[void]` | Print a string |
 | `read_int() -> IO[Input[Integer]]` | Read integer from stdin |
-| `read_string[N]() -> IO[Input[String[N]]]` | Read string from stdin |
-| `read_file[N, P](path: String[P]) -> IO[Input[String[N]]]` | Read file contents |
-| `http_get[N, U](url: String[U]) -> IO[Input[String[N]]]` | HTTP GET (host uses curl) |
+| `read_string[N]() -> IO[Input[String(N)]]` | Read string from stdin |
+| `read_file[N, P](path: String(P)) -> IO[Input[String(N)]]` | Read file contents |
+| `http_get[N, U](url: String(U)) -> IO[Input[String(N)]]` | HTTP GET (host uses curl) |
 
 ---
 
@@ -361,7 +378,7 @@ The embedded standard library is resolved and SMT-verified at compiler startup. 
 
 Errors include a short `hint:` line when the compiler can suggest a fix:
 
-- **Type mismatches** show expected and actual types using readable names (`String[20]`, `List[5, Integer]`)
+- **Type mismatches** show expected and actual types using readable names (`String(20)`, `List(5)[Integer]`)
 - **Generic inference failures** name the callee and suggest explicit instantiation (e.g. `read_file[1024, 256](path)`)
 - **Static size errors** explain that Lattice has no heap — capacities must appear in types or generic arguments
 - **Safety failures** show the constraint that could not be proved (e.g. `idx >= 0 && idx < N`) and how to guard it
@@ -408,6 +425,6 @@ These are **not** part of the current language, even if they appear in older dra
 - No dynamic allocation or unbounded collections
 - No general multi-dispatch overloading (stdlib defines explicit `add` for `Rational`)
 - `server function` is parsed but not code-generated
-- `IO[T]` is not enforced as an effect system; it documents host interactions
+- `IO[T]` is enforced: pure functions cannot perform host interaction; functions with IO effects infer `IO[...]` return types
 - WASM values are lowered primarily as i32; width optimization is not yet implemented
 - CLI `main` arguments are untyped integers from the host

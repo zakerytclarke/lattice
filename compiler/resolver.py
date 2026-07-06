@@ -2,8 +2,23 @@
 
 import sys
 from compiler.parser import *
+from compiler.input_types import validate_input_target_type, _input_hint
+from compiler.string_literal import lower_string_literal
+from compiler.overloads import (
+    BINOP_TO_FUNCTION,
+    UNOP_TO_FUNCTION,
+    INTEGER_BINOPS,
+    CHAR_BINOPS,
+    BOOL_BINOPS,
+    get_overloads,
+    iter_all_functions,
+    register_function,
+    resolve_call,
+    ensure_mangled_name,
+)
 from compiler.errors import (
     LatticeTypeError,
+    error_site_from_expr,
     format_expr,
     format_type,
     format_type_expr,
@@ -86,7 +101,7 @@ class ListResolvedType(ResolvedType):
         self.length = length # int (resolved length)
         self.elem_type = elem_type # ResolvedType
     def __repr__(self):
-        return f"List[{self.length}, {self.elem_type}]"
+        return f"List({self.length})[{self.elem_type}]" if self.length is not None else f"List[{self.elem_type}]"
     def get_size(self, resolver):
         length = self.length if self.length is not None else 0
         return length * self.elem_type.get_size(resolver)
@@ -95,7 +110,7 @@ class StringResolvedType(ResolvedType):
     def __init__(self, max_len):
         self.max_len = max_len
     def __repr__(self):
-        return f"String[{self.max_len}]"
+        return f"String({self.max_len})"
     def get_size(self, resolver):
         # max_len chars + 4 bytes for current length field
         return (self.max_len * 4) + 4
@@ -121,9 +136,23 @@ class Resolver:
             'Type': PrimitiveResolvedType('Type'),
             'void': PrimitiveResolvedType('void'),
         }
-        self.functions = {
-            'print_int': FuncDecl('external', 'print_int', [], [Param('val', TypeExpr('Integer', [], 0), 0)], TypeExpr('IO', [TypeExpr('void', [], 0)], 0), [], [], 0)
-        }
+        self.functions = {}
+        register_function(
+            self.functions,
+            FuncDecl(
+                'external',
+                'print_int',
+                [],
+                [Param('val', TypeExpr('Integer', [], 0), 0)],
+                TypeExpr('IO', [TypeExpr('void', [], 0)], 0),
+                [],
+                [],
+                0,
+            ),
+        )
+        self.resolved_calls = {}
+        self.resolved_binops = {}
+        self.resolved_unops = {}
         self.type_decls = {}
         self.func_locals = {}
         self.globals = {} # name -> (ResolvedType, offset)
@@ -131,12 +160,32 @@ class Resolver:
         self.current_generic_map = {}
         self.current_func = None
         self._checking_call = None
+        self.current_func_has_io = False
+        self._input_expected_type = None
+        self.input_call_sites = []
+        self.input_call_exprs = {}
+        self.diagnostics = None
+        self.inferred_bindings = {}
+        self.inferred_return_types = set()
+        self._current_file_name = None
+        self._current_source_lines = None
         
         # Local environments
         self.locals = {} # name -> (ResolvedType, offset)
         self.const_locals = set()
+        self.immutable_locals = set()
         self.local_offset = 0
         self.max_local_offset = 0
+
+    def _record_error(self, error):
+        if self.diagnostics:
+            self.diagnostics.add(
+                error,
+                file_name=self._current_file_name,
+                source_lines=self._current_source_lines,
+            )
+        else:
+            raise error
 
     def register_type(self, name, resolved_type):
         self.types[name] = resolved_type
@@ -147,6 +196,72 @@ class Resolver:
         if self.current_func:
             return self.current_func.name
         return "<unknown>"
+
+    def _build_type_generic_map(self, decl, te, generic_map):
+        local_generic_map = {}
+        type_arg_idx = 0
+        size_for_int = te.size
+        for gname, gtype in decl.generics:
+            gtype_name = gtype.name if hasattr(gtype, 'name') else str(gtype)
+            if gtype_name == 'Type':
+                if type_arg_idx < len(te.args):
+                    local_generic_map[gname] = self.resolve_type_expr(
+                        te.args[type_arg_idx], generic_map
+                    )
+                    type_arg_idx += 1
+                else:
+                    local_generic_map[gname] = None
+            elif gtype_name == 'Integer':
+                if size_for_int is not None:
+                    try:
+                        local_generic_map[gname] = self.evaluate_constant(
+                            size_for_int, generic_map
+                        )
+                    except LatticeTypeError:
+                        if (
+                            isinstance(size_for_int, TypeExpr)
+                            and size_for_int.name in generic_map
+                        ):
+                            local_generic_map[gname] = generic_map[size_for_int.name]
+                        else:
+                            local_generic_map[gname] = None
+                    size_for_int = None
+                elif type_arg_idx < len(te.args):
+                    arg_val = te.args[type_arg_idx]
+                    type_arg_idx += 1
+                    try:
+                        local_generic_map[gname] = self.evaluate_constant(
+                            arg_val, generic_map
+                        )
+                    except LatticeTypeError:
+                        local_generic_map[gname] = None
+                else:
+                    local_generic_map[gname] = None
+            else:
+                local_generic_map[gname] = None
+        return local_generic_map
+
+    def _resolve_list_or_group(self, te, generic_map):
+        if len(te.args) != 1:
+            raise LatticeTypeError(
+                "List/Group requires an element type: List[T] or List(N)[T]",
+                te.line,
+                hint="Use List[Integer] for inferred capacity, or List(10)[Integer] for a fixed length.",
+            )
+        elem_type = self.resolve_type_expr(te.args[0], generic_map)
+        if elem_type is None:
+            elem_type = self.types['Integer']
+        length = None
+        if te.size is not None:
+            try:
+                length = self.evaluate_constant(te.size, generic_map)
+            except LatticeTypeError:
+                if isinstance(te.size, TypeExpr) and te.size.name in generic_map:
+                    val = generic_map[te.size.name]
+                    length = None if val is None else val
+                else:
+                    raise
+        return ListResolvedType(length, elem_type)
 
     def resolve_type_expr(self, te, generic_map=None):
         generic_map = generic_map or self.current_generic_map
@@ -171,43 +286,11 @@ class Resolver:
             # If it's a number/value, it might parameterize a type
             name = str(val)
 
-        if name == 'List':
-            # List[Length, ElemType]
-            if len(te.args) != 2:
-                raise LatticeTypeError("List type requires 2 arguments: List[Len, Elem]", te.line)
-            
-            # Resolve length — allow unresolved generic size parameters during body resolution
-            len_arg = te.args[0]
-            try:
-                length = self.evaluate_constant(len_arg, generic_map)
-            except LatticeTypeError:
-                if isinstance(len_arg, TypeExpr) and len_arg.name in generic_map:
-                    length = 0 if generic_map[len_arg.name] is not None else None
-                else:
-                    raise
-            
-            # Resolve element type
-            elem_type = self.resolve_type_expr(te.args[1], generic_map)
-            if elem_type is None:
-                elem_type = self.types['Integer']
-            return ListResolvedType(length, elem_type)
+        if name == 'List' and (te.size is not None or len(te.args) <= 1):
+            return self._resolve_list_or_group(te, generic_map)
 
-        if name == 'Group':
-            if len(te.args) != 2:
-                raise LatticeTypeError("Group type requires 2 arguments", te.line)
-            len_arg = te.args[0]
-            try:
-                length = self.evaluate_constant(len_arg, generic_map)
-            except LatticeTypeError:
-                if isinstance(len_arg, TypeExpr) and len_arg.name in generic_map:
-                    length = 0 if generic_map[len_arg.name] is not None else None
-                else:
-                    raise
-            elem_type = self.resolve_type_expr(te.args[1], generic_map)
-            if elem_type is None:
-                elem_type = self.types['Integer']
-            return ListResolvedType(length, elem_type)
-
+        if name == 'Group' and (te.size is not None or len(te.args) <= 1):
+            return self._resolve_list_or_group(te, generic_map)
 
         if name == 'IO':
             if len(te.args) != 1:
@@ -223,17 +306,8 @@ class Resolver:
         if name in self.type_decls:
             decl = self.type_decls[name]
             if decl.generics:
-                # Map generic parameters to arguments
-                local_generic_map = {}
-                for i, (gname, gtype) in enumerate(decl.generics):
-                    if i < len(te.args):
-                        arg_val = te.args[i]
-                        gtype_name = gtype.name if hasattr(gtype, 'name') else str(gtype)
-                        if gtype_name == 'Type':
-                            local_generic_map[gname] = self.resolve_type_expr(arg_val, generic_map)
-                        else:
-                            local_generic_map[gname] = self.evaluate_constant(arg_val, generic_map)
-                
+                local_generic_map = self._build_type_generic_map(decl, te, generic_map)
+
                 # Build monomorphized name
                 arg_names = []
                 for gname, _ in decl.generics:
@@ -282,11 +356,13 @@ class Resolver:
         raise LatticeTypeError(
             f"Unknown type '{name}'",
             te.line,
-            hint="Check spelling, imports, or provide explicit type parameters (e.g. List[5, Integer]).",
+            hint="Check spelling, imports, or provide explicit type parameters (e.g. List(5)[Integer], String(64)).",
         )
 
     def evaluate_constant(self, expr, generic_map=None):
         generic_map = generic_map or self.current_generic_map
+        if isinstance(expr, int):
+            return expr
         if isinstance(expr, Literal) and expr.val_type == 'Integer':
             return expr.value
         if isinstance(expr, Identifier):
@@ -311,6 +387,156 @@ class Resolver:
             expr.line,
             hint=static_memory_hint(),
         )
+
+    def _string_capacity_from_type_expr(self, type_expr, call_generic_map=None, generic_map=None):
+        if not type_expr or type_expr.name != 'String':
+            return None
+        merged_map = dict(generic_map or self.current_generic_map)
+        for key, val in (call_generic_map or {}).items():
+            if isinstance(val, int):
+                merged_map[key] = val
+        if type_expr.size is not None:
+            try:
+                return self.evaluate_constant(type_expr.size, merged_map)
+            except LatticeTypeError:
+                return None
+        return None
+
+    def _maybe_lower_string_arg(self, arg, param_type_expr, call_generic_map, generic_map):
+        if not isinstance(arg, StringLiteral):
+            return arg
+        cap = self._string_capacity_from_type_expr(param_type_expr, call_generic_map, generic_map)
+        if cap is None:
+            cap = len(arg.value)
+        return lower_string_literal(arg, cap)
+
+    def _struct_string_max_len(self, resolved_type):
+        if isinstance(resolved_type, StructResolvedType) and resolved_type.name.startswith('String_'):
+            suffix = resolved_type.name[len('String_'):]
+            if suffix.isdigit():
+                return int(suffix)
+        return None
+
+    def _compile_time_string(self, expr):
+        if isinstance(expr, StringLiteral):
+            return expr.value
+        if isinstance(expr, Identifier):
+            return self.string_consts.get(expr.name)
+        return None
+
+    def fold_string_concat(self, expr):
+        if expr is None:
+            return expr
+        if isinstance(expr, UnaryExpr):
+            expr.operand = self.fold_string_concat(expr.operand)
+            return expr
+        if isinstance(expr, BinaryExpr):
+            expr.left = self.fold_string_concat(expr.left)
+            expr.right = self.fold_string_concat(expr.right)
+            if expr.op == '+':
+                left_str = self._compile_time_string(expr.left)
+                right_str = self._compile_time_string(expr.right)
+                if left_str is not None and right_str is not None:
+                    return StringLiteral(left_str + right_str, expr.line)
+            return expr
+        if isinstance(expr, CallExpr):
+            expr.args = [self.fold_string_concat(arg) for arg in expr.args]
+            return expr
+        if isinstance(expr, IndexExpr):
+            expr.expr = self.fold_string_concat(expr.expr)
+            expr.index = self.fold_string_concat(expr.index)
+            return expr
+        if isinstance(expr, FieldExpr):
+            expr.expr = self.fold_string_concat(expr.expr)
+            return expr
+        if isinstance(expr, ListLiteral):
+            expr.elements = [self.fold_string_concat(el) for el in expr.elements]
+            return expr
+        return expr
+
+    def _collect_string_consts(self, body):
+        def visit_expr(expr):
+            if isinstance(expr, CallExpr):
+                for arg in expr.args:
+                    visit_expr(arg)
+            elif isinstance(expr, BinaryExpr):
+                visit_expr(expr.left)
+                visit_expr(expr.right)
+            elif isinstance(expr, UnaryExpr):
+                visit_expr(expr.operand)
+            elif isinstance(expr, IndexExpr):
+                visit_expr(expr.expr)
+                visit_expr(expr.index)
+            elif isinstance(expr, FieldExpr):
+                visit_expr(expr.expr)
+            elif isinstance(expr, ListLiteral):
+                for el in expr.elements:
+                    visit_expr(el)
+
+        def visit_stmt(stmt):
+            if isinstance(stmt, VarDecl):
+                if isinstance(stmt.value, StringLiteral):
+                    self.string_consts[stmt.name] = stmt.value.value
+                visit_expr(stmt.value)
+            elif isinstance(stmt, Assign):
+                visit_expr(stmt.target)
+                visit_expr(stmt.value)
+            elif isinstance(stmt, IfStmt):
+                visit_expr(stmt.cond)
+                for s in stmt.then_branch:
+                    visit_stmt(s)
+                for s in stmt.else_branch:
+                    visit_stmt(s)
+            elif isinstance(stmt, ForStmt):
+                visit_expr(stmt.start)
+                visit_expr(stmt.end)
+                for s in stmt.body:
+                    visit_stmt(s)
+            elif isinstance(stmt, MatchStmt):
+                visit_expr(stmt.expr)
+                for case in stmt.cases:
+                    for s in case.body:
+                        visit_stmt(s)
+            elif isinstance(stmt, ReturnStmt):
+                if stmt.expr:
+                    visit_expr(stmt.expr)
+            elif isinstance(stmt, ExprStmt):
+                visit_expr(stmt.expr)
+
+        for stmt in body:
+            visit_stmt(stmt)
+
+    def _fold_body_exprs(self, body):
+        def fold_stmt(stmt):
+            if isinstance(stmt, VarDecl):
+                stmt.value = self.fold_string_concat(stmt.value)
+            elif isinstance(stmt, Assign):
+                stmt.target = self.fold_string_concat(stmt.target)
+                stmt.value = self.fold_string_concat(stmt.value)
+            elif isinstance(stmt, IfStmt):
+                stmt.cond = self.fold_string_concat(stmt.cond)
+                for s in stmt.then_branch:
+                    fold_stmt(s)
+                for s in stmt.else_branch:
+                    fold_stmt(s)
+            elif isinstance(stmt, ForStmt):
+                stmt.start = self.fold_string_concat(stmt.start)
+                stmt.end = self.fold_string_concat(stmt.end)
+                for s in stmt.body:
+                    fold_stmt(s)
+            elif isinstance(stmt, MatchStmt):
+                stmt.expr = self.fold_string_concat(stmt.expr)
+                for case in stmt.cases:
+                    for s in case.body:
+                        fold_stmt(s)
+            elif isinstance(stmt, ReturnStmt):
+                if stmt.expr:
+                    stmt.expr = self.fold_string_concat(stmt.expr)
+            elif isinstance(stmt, ExprStmt):
+                stmt.expr = self.fold_string_concat(stmt.expr)
+
+        for stmt in body:
+            fold_stmt(stmt)
 
     def finalize_generic_map(self, generic_map, generic_decls, line, callee_name=None, allow_function_generics=False):
         callee_name = callee_name or self._current_callee_name()
@@ -337,14 +563,154 @@ class Resolver:
             )
         return generic_map
 
+    def _unwrap_io_type(self, resolved_type):
+        if isinstance(resolved_type, IOResolvedType):
+            return resolved_type.inner
+        return resolved_type
+
+    def _body_has_io(self, body):
+        saved_locals = dict(self.locals)
+        found = False
+
+        def expr_has_io(expr):
+            if self._is_input_call(expr):
+                return True
+            try:
+                t = self.infer_expr_type(expr)
+            except LatticeTypeError:
+                return False
+            return isinstance(t, IOResolvedType)
+
+        def walk(stmts):
+            nonlocal found
+            for stmt in stmts:
+                if isinstance(stmt, VarDecl):
+                    if expr_has_io(stmt.value):
+                        found = True
+                    try:
+                        if stmt.type_expr:
+                            bound_t = self.resolve_type_expr(stmt.type_expr)
+                        else:
+                            value_t = self.infer_expr_type(stmt.value)
+                            bound_t = self._unwrap_io_type(value_t)
+                        self.locals[stmt.name] = (bound_t, 0)
+                    except LatticeTypeError:
+                        pass
+                elif isinstance(stmt, ExprStmt):
+                    if expr_has_io(stmt.expr):
+                        found = True
+                elif isinstance(stmt, ReturnStmt):
+                    if stmt.expr and expr_has_io(stmt.expr):
+                        found = True
+                elif isinstance(stmt, IfStmt):
+                    walk(stmt.then_branch)
+                    walk(stmt.else_branch)
+                elif isinstance(stmt, ForStmt):
+                    walk(stmt.body)
+                elif isinstance(stmt, MatchStmt):
+                    for case in stmt.cases:
+                        walk(case.body)
+                elif isinstance(stmt, Assign):
+                    if expr_has_io(stmt.value):
+                        found = True
+
+        walk(body)
+        self.locals = saved_locals
+        return found
+
+    def _require_io_allowed(self, line, context="IO operation"):
+        if not self.current_func_has_io:
+            raise LatticeTypeError(
+                f"{context} in pure function",
+                line,
+                hint="Only functions with IO effects (or an explicit -> IO[...] return type) may perform host interaction.",
+            )
+
+    def _is_input_call(self, expr):
+        return (
+            isinstance(expr, CallExpr)
+            and isinstance(expr.func, Identifier)
+            and expr.func.name == "input"
+        )
+
+    def _register_input_call(self, expr, resolved_type, type_expr=None):
+        key = id(expr)
+        if key in self.input_call_exprs:
+            return self.input_call_exprs[key]
+        validate_input_target_type(resolved_type, type_expr, expr.line)
+        site_id = len(self.input_call_sites)
+        column = getattr(expr.func, "column", 1)
+        self.input_call_sites.append(
+            {
+                "id": site_id,
+                "line": expr.line,
+                "column": column,
+                "resolved_type": resolved_type,
+                "type_expr": type_expr,
+            }
+        )
+        self.input_call_exprs[key] = site_id
+        return site_id
+
+    def _check_input_call(self, expr, generic_map):
+        if id(expr) in self.input_call_exprs:
+            return
+
+        if self._input_expected_type is None:
+            raise LatticeTypeError(
+                "Cannot infer the result type of input(...)",
+                expr.line,
+                column=getattr(expr.func, "column", None),
+                span=len("input"),
+                hint=_input_hint(),
+            )
+        if len(expr.args) != 1:
+            raise LatticeTypeError(
+                "Wrong number of arguments to 'input': expected 1 prompt string, "
+                f"got {len(expr.args)}",
+                expr.line,
+                hint='Usage: let value: YourType = input("prompt text");',
+            )
+        self._register_input_call(expr, self._input_expected_type, None)
+        arg_t = self.infer_expr_type(expr.args[0], generic_map)
+        if isinstance(expr.args[0], StringLiteral):
+            cap = len(expr.args[0].value)
+            expr.args[0] = lower_string_literal(expr.args[0], cap)
+            arg_t = self.infer_expr_type(expr.args[0], generic_map)
+        prompt_param = get_overloads(self.functions, "input")[0].params[0]
+        prompt_t = self.resolve_type_expr(prompt_param.type_expr)
+        if isinstance(prompt_t, RefinedResolvedType):
+            prompt_t = prompt_t.base_type
+        if isinstance(prompt_t, StructResolvedType) and prompt_t.name.startswith("String_"):
+            pass
+        else:
+            prompt_te = TypeExpr("String", [], expr.line, size=TypeExpr("PromptLen", [], expr.line))
+            prompt_t = self.resolve_type_expr(prompt_te)
+        try:
+            self.types_compatible(prompt_t, arg_t, expr.line)
+        except LatticeTypeError as e:
+            raise LatticeTypeError(
+                f"Argument 1 ('prompt') to 'input': {e.message}",
+                expr.line,
+                hint=e.hint,
+            ) from e
+
     def types_compatible(self, expected, actual, line):
         if expected is None or actual is None:
             return
 
-        if isinstance(expected, IOResolvedType):
+        if isinstance(expected, IOResolvedType) and not isinstance(actual, IOResolvedType):
             return self.types_compatible(expected.inner, actual, line)
-        if isinstance(actual, IOResolvedType):
-            return self.types_compatible(expected, actual.inner, line)
+
+        if isinstance(actual, IOResolvedType) and not isinstance(expected, IOResolvedType):
+            raise LatticeTypeError(
+                type_mismatch_message(expected, actual, "Expected a pure value, got an IO action"),
+                line,
+                hint="IO actions may only appear in IO functions. Use `let x = io_call(...)` to run the action and bind its result.",
+            )
+
+        if isinstance(expected, IOResolvedType) and isinstance(actual, IOResolvedType):
+            return self.types_compatible(expected.inner, actual.inner, line)
 
         if isinstance(actual, RefinedResolvedType):
             actual = actual.base_type
@@ -414,10 +780,6 @@ class Resolver:
                 )
             return
 
-        if isinstance(expected, IOResolvedType) and isinstance(actual, IOResolvedType):
-            self.types_compatible(expected.inner, actual.inner, line)
-            return
-
         if type(expected) is not type(actual):
             raise LatticeTypeError(
                 type_mismatch_message(expected, actual, "Incompatible types"),
@@ -440,33 +802,17 @@ class Resolver:
             self._checking_call = prev_callee
 
     def _check_call_types_impl(self, expr, generic_map, func_name):
-        if func_name in self.functions:
-            callee = self.functions[func_name]
-            if len(expr.args) != len(callee.params):
-                param_names = ", ".join(
-                    f"{p.name}: {format_type_expr(p.type_expr) if p.type_expr else '?'}"
-                    for p in callee.params
-                )
-                raise LatticeTypeError(
-                    f"Wrong number of arguments to '{func_name}': expected {len(callee.params)}, got {len(expr.args)}",
-                    expr.line,
-                    hint=f"Expected signature: {func_name}({param_names})",
-                )
+        if func_name == "input":
+            self._check_input_call(expr, generic_map)
+            return
 
-            call_generic_map = {}
-            if callee.generics:
-                for gname, _ in callee.generics:
-                    call_generic_map[gname] = None
-                if expr.generic_args:
-                    for i, (gname, _) in enumerate(callee.generics):
-                        if i < len(expr.generic_args):
-                            call_generic_map[gname] = expr.generic_args[i]
-                else:
-                    for idx, arg in enumerate(expr.args):
-                        if idx < len(callee.params):
-                            arg_t = self.infer_expr_type(arg, generic_map)
-                            self.infer_call_generics(callee.params[idx].type_expr, arg_t, call_generic_map)
-                self.finalize_generic_map(call_generic_map, callee.generics, expr.line, callee_name=func_name)
+        if get_overloads(self.functions, func_name):
+            callee, call_generic_map = resolve_call(self, func_name, expr, generic_map)
+            for idx, arg in enumerate(expr.args):
+                if isinstance(arg, StringLiteral):
+                    expr.args[idx] = self._maybe_lower_string_arg(
+                        arg, callee.params[idx].type_expr, call_generic_map, generic_map
+                    )
 
             for idx, arg in enumerate(expr.args):
                 arg_t = self.infer_expr_type(arg, generic_map)
@@ -519,6 +865,12 @@ class Resolver:
                 self.finalize_generic_map(call_generic_map, decl.generics, expr.line, callee_name=func_name)
 
             for idx, arg in enumerate(expr.args):
+                if isinstance(arg, StringLiteral):
+                    expr.args[idx] = self._maybe_lower_string_arg(
+                        arg, decl.fields[idx][1], call_generic_map, generic_map
+                    )
+
+            for idx, arg in enumerate(expr.args):
                 arg_t = self.infer_expr_type(arg, generic_map)
                 fname, field_type_expr = decl.fields[idx]
                 field_t = self.resolve_type_expr(field_type_expr, call_generic_map or generic_map)
@@ -530,6 +882,30 @@ class Resolver:
                         expr.line,
                         hint=e.hint,
                     ) from e
+
+    def _binding_to_type_expr(self, val, line):
+        if isinstance(val, int):
+            return Literal(val, 'Integer', line)
+        if isinstance(val, ResolvedType):
+            return self.resolved_to_type_expr(val, line)
+        if isinstance(val, TypeExpr):
+            return val
+        return TypeExpr(str(val), [], line)
+
+    def generic_bindings_to_type_expr(self, type_name, decl, bindings, line):
+        args = []
+        size = None
+        for gname, gtype in decl.generics:
+            val = bindings.get(gname)
+            te_val = self._binding_to_type_expr(val, line)
+            gtype_name = gtype.name if hasattr(gtype, 'name') else str(gtype)
+            if gtype_name == 'Integer' and type_name in ('List', 'Group', 'String'):
+                size = te_val
+            elif gtype_name == 'Type':
+                args.append(te_val)
+            else:
+                args.append(te_val)
+        return TypeExpr(type_name, args, line, size=size)
 
     def resolved_to_type_expr(self, r_t, line):
         if not r_t:
@@ -544,7 +920,15 @@ class Resolver:
         if isinstance(r_t, StructResolvedType) or isinstance(r_t, UnionResolvedType):
             return TypeExpr(r_t.name, [], line)
         if isinstance(r_t, ListResolvedType):
-            return TypeExpr('List', [Literal(r_t.length, 'Integer', line), self.resolved_to_type_expr(r_t.elem_type, line)], line)
+            elem_te = self.resolved_to_type_expr(r_t.elem_type, line)
+            te = TypeExpr('List', [elem_te], line)
+            if r_t.length is not None:
+                te.size = Literal(r_t.length, 'Integer', line)
+            return te
+        if isinstance(r_t, StringResolvedType):
+            return TypeExpr('String', [], line, size=Literal(r_t.max_len, 'Integer', line))
+        if isinstance(r_t, IOResolvedType):
+            return TypeExpr('IO', [self.resolved_to_type_expr(r_t.inner, line)], line)
         return TypeExpr('Integer', [], line)
 
     def infer_call_generics(self, param_type, arg_type, call_generic_map):
@@ -556,13 +940,27 @@ class Resolver:
                 return
             
             if isinstance(arg_type, ListResolvedType) and param_type.name in ['List', 'Group']:
-                if len(param_type.args) == 2:
-                    len_arg = param_type.args[0]
-                    if isinstance(len_arg, TypeExpr) and len_arg.name in call_generic_map:
-                        call_generic_map[len_arg.name] = arg_type.length
-                    elem_arg = param_type.args[1]
+                if len(param_type.args) == 1:
+                    elem_arg = param_type.args[0]
                     if isinstance(elem_arg, TypeExpr) and elem_arg.name in call_generic_map:
                         call_generic_map[elem_arg.name] = arg_type.elem_type
+                    if param_type.size is not None:
+                        if (
+                            isinstance(param_type.size, TypeExpr)
+                            and param_type.size.name in call_generic_map
+                        ):
+                            call_generic_map[param_type.size.name] = arg_type.length
+                return
+
+            if (
+                param_type.name == 'String'
+                and param_type.size is not None
+                and isinstance(param_type.size, TypeExpr)
+                and param_type.size.name in call_generic_map
+            ):
+                max_len = self._struct_string_max_len(arg_type)
+                if max_len is not None:
+                    call_generic_map[param_type.size.name] = max_len
                 return
                 
             if hasattr(arg_type, 'name') and arg_type.name.startswith(param_type.name):
@@ -583,12 +981,66 @@ class Resolver:
                                         except Exception:
                                             pass
 
+    def _is_integer_builtin_binop(self, op, left_t, right_t):
+        return (
+            left_t.name == 'Integer'
+            and right_t.name == 'Integer'
+            and op in INTEGER_BINOPS
+        )
+
+    def _is_char_builtin_binop(self, op, left_t, right_t):
+        return (
+            left_t.name == 'Char'
+            and right_t.name == 'Char'
+            and op in CHAR_BINOPS
+        )
+
+    def _is_bool_builtin_binop(self, op, left_t, right_t):
+        return (
+            left_t.name == 'Bool'
+            and right_t.name == 'Bool'
+            and op in BOOL_BINOPS
+        )
+
+    def _is_bool_builtin_unop(self, op, operand_t):
+        return op == '!' and operand_t.name == 'Bool'
+
+    def _resolve_operator_overload(self, func_name, left, right, line, generic_map):
+        fake_call = CallExpr(
+            Identifier(func_name, line),
+            [left, right],
+            [],
+            line,
+        )
+        return resolve_call(self, func_name, fake_call, generic_map)
+
+    def _try_record_binop_overload(self, expr, op, left_t, right_t, generic_map):
+        op_func = BINOP_TO_FUNCTION.get(op)
+        if not op_func or not get_overloads(self.functions, op_func):
+            return None
+        callee, call_generic_map = self._resolve_operator_overload(
+            op_func, expr.left, expr.right, expr.line, generic_map
+        )
+        self.resolved_binops[id(expr)] = {
+            "decl": callee,
+            "generic_map": call_generic_map,
+        }
+        if callee.ret_type:
+            ret_t = self.resolve_type_expr(callee.ret_type, call_generic_map)
+            if isinstance(ret_t, IOResolvedType):
+                return ret_t
+            return ret_t
+        return self.types['void']
+
     def infer_expr_type(self, expr, generic_map=None):
         generic_map = generic_map or self.current_generic_map
         
         if isinstance(expr, Literal):
             return self.types[expr.val_type]
-            
+
+        if isinstance(expr, StringLiteral):
+            return self.infer_expr_type(lower_string_literal(expr, len(expr.value)), generic_map)
+
         if isinstance(expr, Identifier):
             # 1. Check local variable
             if expr.name in self.locals:
@@ -605,28 +1057,98 @@ class Resolver:
                     return self.types['Integer']
                 if val is None and expr.name in self.current_generic_map:
                     return self.types['Integer']
-            raise LatticeTypeError(f"Undefined variable '{expr.name}'", expr.line)
+            line, column, span = error_site_from_expr(expr)
+            raise LatticeTypeError(
+                f"Undefined variable '{expr.name}'",
+                line,
+                column=column,
+                span=span,
+            )
+
+        if isinstance(expr, UnaryExpr):
+            operand_t = self.infer_expr_type(expr.operand, generic_map)
+            if self._is_bool_builtin_unop(expr.op, operand_t):
+                return self.types['Bool']
+            op_func = UNOP_TO_FUNCTION.get(expr.op)
+            if op_func and get_overloads(self.functions, op_func):
+                fake_call = CallExpr(
+                    Identifier(op_func, expr.line),
+                    [expr.operand],
+                    [],
+                    expr.line,
+                )
+                callee, call_generic_map = resolve_call(
+                    self, op_func, fake_call, generic_map
+                )
+                self.resolved_unops[id(expr)] = {
+                    "decl": callee,
+                    "generic_map": call_generic_map,
+                }
+                if callee.ret_type:
+                    return self.resolve_type_expr(callee.ret_type, call_generic_map)
+                return self.types['void']
+            if expr.op == '!':
+                return self.types['Bool']
+            return operand_t
 
         if isinstance(expr, BinaryExpr):
             left_t = self.infer_expr_type(expr.left, generic_map)
             right_t = self.infer_expr_type(expr.right, generic_map)
-            
-            # Simple inference: promote Int and Rational to Rational
-            if left_t.name == 'Integer' and right_t.name == 'Integer':
+
+            if self._is_bool_builtin_binop(expr.op, left_t, right_t):
+                return self.types['Bool']
+
+            if self._is_integer_builtin_binop(expr.op, left_t, right_t):
                 if expr.op == '/':
-                    return self.types['Integer'] # Default to Integer division, can promote later
+                    return self.types['Integer']
                 if expr.op in ['==', '!=', '<', '>', '<=', '>=']:
                     return self.types['Bool']
                 return self.types['Integer']
-                
-            if 'Rational' in [left_t.name, right_t.name]:
-                if expr.op in ['==', '!=', '<', '>', '<=', '>=']:
-                    return self.types['Bool']
-                return self.types['Rational']
-                
-            if expr.op in ['&&', '||']:
+
+            if self._is_char_builtin_binop(expr.op, left_t, right_t):
                 return self.types['Bool']
-                
+
+            left_max = self._struct_string_max_len(left_t)
+            right_max = self._struct_string_max_len(right_t)
+            if left_max is not None and right_max is not None:
+                if expr.op == '+':
+                    out_max = left_max + right_max
+                    ret_t = self.resolve_type_expr(
+                        TypeExpr('String', [], expr.line, size=Literal(out_max, 'Integer', expr.line)),
+                        generic_map,
+                    )
+                    try:
+                        overload_ret = self._try_record_binop_overload(
+                            expr, expr.op, left_t, right_t, generic_map
+                        )
+                        if overload_ret is not None:
+                            return overload_ret
+                    except LatticeTypeError:
+                        pass
+                    return ret_t
+                if expr.op in ['==', '!=']:
+                    try:
+                        overload_ret = self._try_record_binop_overload(
+                            expr, expr.op, left_t, right_t, generic_map
+                        )
+                        if overload_ret is not None:
+                            return overload_ret
+                    except LatticeTypeError:
+                        pass
+                    return self.types['Bool']
+
+            try:
+                overload_ret = self._try_record_binop_overload(
+                    expr, expr.op, left_t, right_t, generic_map
+                )
+                if overload_ret is not None:
+                    return overload_ret
+            except LatticeTypeError:
+                pass
+
+            if expr.op in ['==', '!=', '<', '>', '<=', '>=']:
+                return self.types['Bool']
+
             return left_t
 
         if isinstance(expr, ListLiteral):
@@ -635,12 +1157,12 @@ class Resolver:
                     "Cannot infer type of empty list literal",
                     expr.line,
                     hint=(
-                        "Give an explicit type, e.g. let xs: List[5, Integer] = List([]), "
-                        "or initialize with elements: List([1, 2, 3]). " + static_memory_hint()
+                        "Give an explicit type, e.g. let xs: List(5)[Integer] = List([1, 2, 3]), "
+                        "or List[Integer] with inferred length. " + static_memory_hint()
                     ),
                 )
             first_t = self.infer_expr_type(expr.elements[0], generic_map)
-            for el in expr.elements[1:]:
+            for i, el in enumerate(expr.elements[1:], start=1):
                 elt = self.infer_expr_type(el, generic_map)
                 if elt.name != first_t.name:
                     raise LatticeTypeError(
@@ -648,8 +1170,13 @@ class Resolver:
                         f"got {format_type(elt)} at position {i + 1}",
                         expr.line,
                     )
-            te = TypeExpr('List', [Literal(len(expr.elements), 'Integer', expr.line), TypeExpr(first_t.name, [], expr.line)], expr.line)
-            return self.resolve_type_expr(te, generic_map)
+            list_te = TypeExpr(
+                'List',
+                [TypeExpr(first_t.name, [], expr.line)],
+                expr.line,
+                size=Literal(len(expr.elements), 'Integer', expr.line),
+            )
+            return self.resolve_type_expr(list_te, generic_map)
 
         if isinstance(expr, IndexExpr):
             arr_t = self.infer_expr_type(expr.expr, generic_map)
@@ -681,8 +1208,19 @@ class Resolver:
                 func_name = expr.func.name
             else:
                 raise LatticeTypeError("Dynamic function calls not supported", expr.line)
+
+            if func_name == "input":
+                if self._input_expected_type is None:
+                    raise LatticeTypeError(
+                        "Cannot infer the result type of input(...)",
+                        expr.line,
+                        column=getattr(expr.func, "column", None),
+                        span=len("input"),
+                        hint=_input_hint(),
+                    )
+                return IOResolvedType(self._input_expected_type)
                 
-            if func_name not in self.functions:
+            if not get_overloads(self.functions, func_name):
                 if func_name in self.types or func_name in self.type_decls:
                     if func_name in self.type_decls:
                         decl = self.type_decls[func_name]
@@ -724,38 +1262,24 @@ class Resolver:
                             mono_name = f"{func_name}_{'_'.join(arg_names)}"
                             if mono_name in self.types:
                                 return self.types[mono_name]
-                            te = TypeExpr(func_name, [self.resolved_to_type_expr(t, expr.line) for t in local_generic_map.values()], expr.line)
+                            te = self.generic_bindings_to_type_expr(
+                                func_name, decl, local_generic_map, expr.line
+                            )
                             return self.resolve_type_expr(te, generic_map)
                     return self.resolve_type_expr(TypeExpr(func_name, [], expr.line), generic_map)
-                raise LatticeTypeError(f"Undefined function '{func_name}'", expr.line)
+                line, column, span = error_site_from_expr(expr)
+                raise LatticeTypeError(
+                    f"Undefined function '{func_name}'",
+                    line,
+                    column=column,
+                    span=span,
+                    hint="Check spelling, imports, or use a stdlib function such as print_string or print_char.",
+                )
                 
-            f_decl = self.functions[func_name]
-            
-            # Simple generic resolution logic
-            call_generic_map = {}
-            if f_decl.generics:
-                for gname, _ in f_decl.generics:
-                    call_generic_map[gname] = None
-                if expr.generic_args:
-                    for i, (gname, _) in enumerate(f_decl.generics):
-                        if i < len(expr.generic_args):
-                            call_generic_map[gname] = expr.generic_args[i]
-                else:
-                    for idx, param in enumerate(f_decl.params):
-                        if idx < len(expr.args):
-                            arg_t = self.infer_expr_type(expr.args[idx], generic_map)
-                            self.infer_call_generics(param.type_expr, arg_t, call_generic_map)
-                
-                for gname, gtype_expr in f_decl.generics:
-                    if call_generic_map[gname] is None:
-                        gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
-                        if gtype_name == 'Type':
-                            call_generic_map[gname] = self.types['Integer']
-                self.finalize_generic_map(call_generic_map, f_decl.generics, expr.line, callee_name=func_name)
+            callee, call_generic_map = resolve_call(self, func_name, expr, generic_map)
 
-            # Infer return type with solved generics
-            if f_decl.ret_type:
-                return self.resolve_type_expr(f_decl.ret_type, call_generic_map)
+            if callee.ret_type:
+                return self.resolve_type_expr(callee.ret_type, call_generic_map)
             return self.types['void']
 
         raise LatticeTypeError("Could not infer type of expression", expr.line)
@@ -768,54 +1292,68 @@ class Resolver:
         for decl in prog.decls:
             if type(decl).__name__ == 'ImportDecl':
                 continue
-            if isinstance(decl, TypeDecl):
-                if decl.name in self.type_decls or decl.name in self.types:
-                    raise LatticeTypeError(f"Redefinition of type '{decl.name}'", decl.line)
-                self.type_decls[decl.name] = decl
-                if not decl.generics:
-                    # Non-generic Struct placeholder
-                    self.register_type(decl.name, StructResolvedType(decl.name, [], decl.invariants))
-            elif isinstance(decl, UnionTypeDecl):
-                if decl.name in self.type_decls or decl.name in self.types:
-                    raise LatticeTypeError(f"Redefinition of type '{decl.name}'", decl.line)
-                self.type_decls[decl.name] = decl
-                if not decl.generics:
-                    # Non-generic Union placeholder
-                    self.register_type(decl.name, UnionResolvedType(decl.name, []))
-            elif isinstance(decl, FuncDecl):
-                if decl.name in self.functions:
-                    raise LatticeTypeError(f"Redefinition of function '{decl.name}'", decl.line)
-                self.functions[decl.name] = decl
+            try:
+                if isinstance(decl, TypeDecl):
+                    if decl.name in self.type_decls or decl.name in self.types:
+                        raise LatticeTypeError(f"Redefinition of type '{decl.name}'", decl.line)
+                    self.type_decls[decl.name] = decl
+                    if not decl.generics:
+                        # Non-generic Struct placeholder
+                        self.register_type(decl.name, StructResolvedType(decl.name, [], decl.invariants))
+                elif isinstance(decl, UnionTypeDecl):
+                    if decl.name in self.type_decls or decl.name in self.types:
+                        raise LatticeTypeError(f"Redefinition of type '{decl.name}'", decl.line)
+                    self.type_decls[decl.name] = decl
+                    if not decl.generics:
+                        # Non-generic Union placeholder
+                        self.register_type(decl.name, UnionResolvedType(decl.name, []))
+                elif isinstance(decl, FuncDecl):
+                    register_function(self.functions, decl)
+            except LatticeTypeError as e:
+                self._record_error(e)
 
         # 2. Second Pass: Populate field types and union variants for non-generic types
         for decl in prog.decls:
-            if isinstance(decl, TypeDecl) and not decl.generics:
-                resolved = self.types[decl.name]
-                fields = []
-                for fname, ftype_expr in decl.fields:
-                    fields.append((fname, self.resolve_type_expr(ftype_expr)))
-                resolved.fields = fields
-            elif isinstance(decl, UnionTypeDecl) and not decl.generics:
-                resolved = self.types[decl.name]
-                variants = []
-                for vexpr in decl.variants:
-                    variants.append(self.resolve_type_expr(vexpr))
-                resolved.variants = variants
+            try:
+                if isinstance(decl, TypeDecl) and not decl.generics:
+                    resolved = self.types[decl.name]
+                    fields = []
+                    for fname, ftype_expr in decl.fields:
+                        fields.append((fname, self.resolve_type_expr(ftype_expr)))
+                    resolved.fields = fields
+                elif isinstance(decl, UnionTypeDecl) and not decl.generics:
+                    resolved = self.types[decl.name]
+                    variants = []
+                    for vexpr in decl.variants:
+                        variants.append(self.resolve_type_expr(vexpr))
+                    resolved.variants = variants
+            except (LatticeTypeError, KeyError) as e:
+                if isinstance(e, KeyError):
+                    continue
+                self._record_error(e)
 
         # 3. Third Pass: Perform memory mapping for global & local variables
         for decl in prog.decls:
             if isinstance(decl, FuncDecl):
-                self.resolve_func_body(decl)
+                try:
+                    self.resolve_func_body(decl)
+                except LatticeTypeError as e:
+                    self._record_error(e)
 
     def check_calls_in_body(self, body):
         def visit_expr(expr):
             if isinstance(expr, CallExpr):
-                self.check_call_types(expr)
+                try:
+                    self.check_call_types(expr)
+                except LatticeTypeError as e:
+                    self._record_error(e)
                 for arg in expr.args:
                     visit_expr(arg)
             elif isinstance(expr, BinaryExpr):
                 visit_expr(expr.left)
                 visit_expr(expr.right)
+            elif isinstance(expr, UnaryExpr):
+                visit_expr(expr.operand)
             elif isinstance(expr, IndexExpr):
                 visit_expr(expr.expr)
                 visit_expr(expr.index)
@@ -824,6 +1362,8 @@ class Resolver:
             elif isinstance(expr, ListLiteral):
                 for el in expr.elements:
                     visit_expr(el)
+            elif isinstance(expr, StringLiteral):
+                pass
 
         def visit_stmt(stmt):
             if isinstance(stmt, VarDecl):
@@ -860,8 +1400,11 @@ class Resolver:
         self.current_func = func
         self.locals = {}
         self.const_locals = set()
+        self.immutable_locals = set()
         self.local_offset = 0
         self.max_local_offset = 0
+        original_ret_type = func.ret_type
+        self.inferred_bindings[func.name] = set()
         
         # Build local generic map for function's own generic parameters.
         # Size generics stay unresolved during body resolution and are inferred at call sites.
@@ -876,12 +1419,42 @@ class Resolver:
         self.current_generic_map = local_generic_map
         
         self.infer_untyped_parameters(func)
+
+        self.string_consts = {}
+        self._collect_string_consts(func.body)
+        self._fold_body_exprs(func.body)
+        
+        self.current_func_has_io = False
         
         # Add parameters to locals (they are laid out at the bottom of stack frame)
         for param in func.params:
             ptype = self.resolve_type_expr(param.type_expr)
             self.locals[param.name] = (ptype, self.local_offset)
+            self.immutable_locals.add(param.name)
             self.local_offset += ptype.get_size(self)
+
+        if func.ret_type:
+            declared_ret = self.resolve_type_expr(func.ret_type)
+            if isinstance(declared_ret, IOResolvedType):
+                self.current_func_has_io = True
+
+        if not self.current_func_has_io:
+            self.current_func_has_io = self._body_has_io(func.body)
+
+        if func.ret_type:
+            declared_ret = self.resolve_type_expr(func.ret_type)
+            if self.current_func_has_io and not isinstance(declared_ret, IOResolvedType):
+                self._record_error(LatticeTypeError(
+                    f"Function '{func.name}' performs IO but is declared to return {format_type(declared_ret)}",
+                    func.line,
+                    hint=f"Change the return type to IO[{format_type(declared_ret)}], or remove host interactions from the body.",
+                ))
+            elif not self.current_func_has_io and isinstance(declared_ret, IOResolvedType):
+                self._record_error(LatticeTypeError(
+                    f"Function '{func.name}' is declared to return {format_type(declared_ret)} but has no IO effects",
+                    func.line,
+                    hint="Remove the IO return type, or add host interactions such as print/read in the body.",
+                ))
             
         # Parse statements to calculate local offsets
         for stmt in func.body:
@@ -889,43 +1462,105 @@ class Resolver:
 
         self.check_calls_in_body(func.body)
             
-        self.infer_return_type(func)
+        try:
+            self.infer_return_type(func)
+            if func.ret_type is not None and original_ret_type is None:
+                self.inferred_return_types.add(func.name)
+        except LatticeTypeError as e:
+            self._record_error(e)
         self.max_local_offset = self.local_offset
-        self.func_locals[func.name] = self.locals
+        self.func_locals[ensure_mangled_name(func)] = self.locals
         self.current_generic_map = {}
         self.current_func = None
 
     def infer_return_type(self, func):
+        has_io = self.current_func_has_io or self._body_has_io(func.body)
+        inner_ret = self.types['void']
+        return_types = []
+
+        def find_returns(stmts):
+            for s in stmts:
+                if isinstance(s, ReturnStmt) and s.expr:
+                    try:
+                        t = self.infer_expr_type(s.expr)
+                        if t:
+                            return_types.append(self._unwrap_io_type(t))
+                    except Exception:
+                        pass
+                elif isinstance(s, IfStmt):
+                    find_returns(s.then_branch)
+                    find_returns(s.else_branch)
+                elif isinstance(s, ForStmt):
+                    find_returns(s.body)
+                elif isinstance(s, MatchStmt):
+                    for case in s.cases:
+                        find_returns(case.body)
+
+        find_returns(func.body)
+        if return_types:
+            inner_ret = return_types[0]
+
         if func.ret_type is None:
-            return_types = []
-            def find_returns(stmts):
-                for s in stmts:
-                    if isinstance(s, ReturnStmt) and s.expr:
-                        try:
-                            t = self.infer_expr_type(s.expr)
-                            if t:
-                                return_types.append(t)
-                        except Exception:
-                            pass
-                    elif isinstance(s, IfStmt):
-                        find_returns(s.then_branch)
-                        find_returns(s.else_branch)
-                    elif isinstance(s, ForStmt):
-                        find_returns(s.body)
-                    elif isinstance(s, MatchStmt):
-                        for case in s.cases:
-                            find_returns(case.body)
-            find_returns(func.body)
-            if return_types:
-                first_ret = return_types[0]
-                func.ret_type = self.resolved_to_type_expr(first_ret, func.line)
+            if has_io:
+                func.ret_type = TypeExpr('IO', [self.resolved_to_type_expr(inner_ret, func.line)], func.line)
+            else:
+                func.ret_type = self.resolved_to_type_expr(inner_ret, func.line)
+        elif has_io:
+            declared = self.resolve_type_expr(func.ret_type)
+            if isinstance(declared, IOResolvedType):
+                for ret_t in return_types:
+                    try:
+                        self.types_compatible(declared.inner, ret_t, func.line)
+                    except LatticeTypeError as e:
+                        raise LatticeTypeError(
+                            f"Return type of '{func.name}': {e.message}",
+                            func.line,
+                            hint=e.hint,
+                        ) from e
 
     def resolve_statement(self, stmt):
+        try:
+            self._resolve_statement(stmt)
+        except LatticeTypeError as e:
+            self._record_error(e)
+
+    def _resolve_statement(self, stmt):
         if isinstance(stmt, VarDecl):
-            t = self.resolve_type_expr(stmt.type_expr) if stmt.type_expr else self.infer_expr_type(stmt.value)
+            if isinstance(stmt.value, StringLiteral):
+                cap = self._string_capacity_from_type_expr(stmt.type_expr)
+                if cap is None:
+                    cap = len(stmt.value.value)
+                stmt.value = lower_string_literal(stmt.value, cap)
+
+            if self._is_input_call(stmt.value) and not stmt.type_expr:
+                raise LatticeTypeError(
+                    "Cannot infer the result type of input(...)",
+                    stmt.line,
+                    hint=_input_hint(),
+                )
+
+            prev_expected = self._input_expected_type
+            if self._is_input_call(stmt.value):
+                expected = self.resolve_type_expr(stmt.type_expr)
+                self._input_expected_type = expected
+                self._register_input_call(stmt.value, expected, stmt.type_expr)
+
+            try:
+                raw_value_t = self.infer_expr_type(stmt.value)
+            finally:
+                self._input_expected_type = prev_expected
+
+            if isinstance(raw_value_t, IOResolvedType):
+                self._require_io_allowed(stmt.line, "IO binding")
+                bound_value_t = raw_value_t.inner
+            else:
+                bound_value_t = raw_value_t
+            t = self.resolve_type_expr(stmt.type_expr) if stmt.type_expr else bound_value_t
+            if not stmt.type_expr and self.current_func:
+                self.inferred_bindings[self.current_func.name].add(stmt.name)
             if stmt.type_expr:
                 try:
-                    self.types_compatible(t, self.infer_expr_type(stmt.value), stmt.line)
+                    self.types_compatible(t, bound_value_t, stmt.line)
                 except LatticeTypeError as e:
                     raise LatticeTypeError(
                         f"Variable '{stmt.name}': {e.message}",
@@ -934,6 +1569,7 @@ class Resolver:
                     ) from e
             # Allocate local storage
             self.locals[stmt.name] = (t, self.local_offset)
+            self.immutable_locals.add(stmt.name)
             if stmt.is_const:
                 self.const_locals.add(stmt.name)
             self.local_offset += t.get_size(self)
@@ -956,6 +1592,9 @@ class Resolver:
             orig_offset = self.local_offset
             # Loop counter index variable
             self.locals[stmt.var_name] = (self.types['Integer'], self.local_offset)
+            self.immutable_locals.add(stmt.var_name)
+            if self.current_func:
+                self.inferred_bindings[self.current_func.name].add(stmt.var_name)
             self.local_offset += 4
             for s in stmt.body:
                 self.resolve_statement(s)
@@ -979,6 +1618,7 @@ class Resolver:
                             break
                 for arg in case.pattern.args:
                     self.locals[arg] = (case_type, self.local_offset)
+                    self.immutable_locals.add(arg)
                     self.local_offset += case_type.get_size(self)
                 for s in case.body:
                     self.resolve_statement(s)
@@ -986,11 +1626,11 @@ class Resolver:
             self.local_offset = max_case_offset
             
         elif isinstance(stmt, Assign):
-            if isinstance(stmt.target, Identifier) and stmt.target.name in self.const_locals:
+            if isinstance(stmt.target, Identifier) and stmt.target.name in self.immutable_locals:
                 raise LatticeTypeError(
-                    f"Cannot assign to const '{stmt.target.name}'",
+                    f"Cannot assign to '{stmt.target.name}' — variables may only be assigned once",
                     stmt.line,
-                    hint="Declare a new binding with let if you need mutability.",
+                    hint="Declare a new let binding for the updated value.",
                 )
             target_t = self.infer_expr_type(stmt.target)
             value_t = self.infer_expr_type(stmt.value)
@@ -999,10 +1639,14 @@ class Resolver:
         elif isinstance(stmt, ReturnStmt):
             if stmt.expr:
                 ret_t = self.infer_expr_type(stmt.expr)
+                if isinstance(ret_t, IOResolvedType):
+                    self._require_io_allowed(stmt.line, "IO action in return")
                 if self.current_func and self.current_func.ret_type:
                     expected = self.resolve_type_expr(self.current_func.ret_type)
+                    if isinstance(expected, IOResolvedType):
+                        expected = expected.inner
                     try:
-                        self.types_compatible(expected, ret_t, stmt.line)
+                        self.types_compatible(expected, self._unwrap_io_type(ret_t), stmt.line)
                     except LatticeTypeError as e:
                         raise LatticeTypeError(
                             f"Return type of '{self.current_func.name}': {e.message}",
@@ -1011,7 +1655,9 @@ class Resolver:
                         ) from e
                 
         elif isinstance(stmt, ExprStmt):
-            self.infer_expr_type(stmt.expr)
+            expr_t = self.infer_expr_type(stmt.expr)
+            if isinstance(expr_t, IOResolvedType):
+                self._require_io_allowed(stmt.line, "IO statement")
 
     def infer_untyped_parameters(self, func):
         untyped_params = [p for p in func.params if p.type_expr is None]
@@ -1057,33 +1703,41 @@ class Resolver:
             if isinstance(expr, CallExpr):
                 if isinstance(expr.func, Identifier):
                     callee_name = expr.func.name
-                    if callee_name in self.functions:
-                        callee_decl = self.functions[callee_name]
-                        call_generic_map = {}
-                        if callee_decl.generics:
-                            for gname, _ in callee_decl.generics:
-                                call_generic_map[gname] = None
+                    if get_overloads(self.functions, callee_name):
+                        overloads = get_overloads(self.functions, callee_name)
+                        callee_decl = None
+                        for cand in overloads:
+                            if len(cand.params) == len(expr.args):
+                                callee_decl = cand
+                                break
+                        if callee_decl is None and overloads:
+                            callee_decl = overloads[0]
+                        if callee_decl is not None:
+                            call_generic_map = {}
+                            if callee_decl.generics:
+                                for gname, _ in callee_decl.generics:
+                                    call_generic_map[gname] = None
+                                for idx, arg in enumerate(expr.args):
+                                    if idx < len(callee_decl.params):
+                                        is_untyped = False
+                                        if isinstance(arg, Identifier):
+                                            for p in func.params:
+                                                if p.name == arg.name and p.type_expr is None:
+                                                    is_untyped = True
+                                                    break
+                                        if not is_untyped:
+                                            try:
+                                                arg_t = self.infer_expr_type(arg, generic_map)
+                                                self.infer_call_generics(callee_decl.params[idx].type_expr, arg_t, call_generic_map)
+                                            except Exception:
+                                                pass
                             for idx, arg in enumerate(expr.args):
-                                if idx < len(callee_decl.params):
-                                    is_untyped = False
-                                    if isinstance(arg, Identifier):
-                                        for p in func.params:
-                                            if p.name == arg.name and p.type_expr is None:
-                                                is_untyped = True
-                                                break
-                                    if not is_untyped:
-                                        try:
-                                            arg_t = self.infer_expr_type(arg, generic_map)
-                                            self.infer_call_generics(callee_decl.params[idx].type_expr, arg_t, call_generic_map)
-                                        except Exception:
-                                            pass
-                        for idx, arg in enumerate(expr.args):
-                            if isinstance(arg, Identifier) and idx < len(callee_decl.params):
-                                param_decl = callee_decl.params[idx]
-                                if param_decl.type_expr:
-                                    resolved_t = self.resolve_type_expr(param_decl.type_expr, call_generic_map)
-                                    if resolved_t:
-                                        add_candidate(arg.name, self.resolved_to_type_expr(resolved_t, expr.line))
+                                if isinstance(arg, Identifier) and idx < len(callee_decl.params):
+                                    param_decl = callee_decl.params[idx]
+                                    if param_decl.type_expr:
+                                        resolved_t = self.resolve_type_expr(param_decl.type_expr, call_generic_map)
+                                        if resolved_t:
+                                            add_candidate(arg.name, self.resolved_to_type_expr(resolved_t, expr.line))
                     elif callee_name in self.type_decls:
                         decl = self.type_decls[callee_name]
                         call_generic_map = {}
@@ -1123,6 +1777,8 @@ class Resolver:
                         add_candidate(expr.right.name, TypeExpr(expr.left.val_type, [], expr.line))
                 visit_expr(expr.left)
                 visit_expr(expr.right)
+            elif isinstance(expr, UnaryExpr):
+                visit_expr(expr.operand)
             elif isinstance(expr, IndexExpr):
                 visit_expr(expr.expr)
                 visit_expr(expr.index)
@@ -1143,5 +1799,6 @@ class Resolver:
                 param.type_expr = clone_ast_node(chosen)
             else:
                 param.type_expr = TypeExpr('Integer', [], func.line)
+            self.inferred_bindings.setdefault(func.name, set()).add(param.name)
 
 

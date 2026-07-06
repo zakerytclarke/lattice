@@ -3,6 +3,9 @@
 import sys
 from compiler.parser import *
 from compiler.resolver import *
+from compiler.string_literal import lower_string_literal
+from compiler.errors import LatticeTypeError
+from compiler.overloads import iter_all_functions, ensure_mangled_name, get_overloads
 
 # ============================================================================
 # WASM Binary Encoding Helpers
@@ -75,8 +78,11 @@ class WASMEmitter:
         
         # Emitter-only placeholder for unresolved size generics.
         # 1. Setup external imports dynamically
-        for name, decl in self.resolver.functions.items():
+        for name, decl in iter_all_functions(self.resolver.functions):
             is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
+            if name == 'input':
+                continue
+            symbol = ensure_mangled_name(decl)
             if is_import:
                 params = [TYPE_I32] * len(decl.params)
                 ret = []
@@ -99,13 +105,14 @@ class WASMEmitter:
                     if ret_t and not (isinstance(ret_t, PrimitiveResolvedType) and ret_t.name == 'void'):
                         ret = [TYPE_I32]
                 self.add_import("env", name, b'\x00', params, ret)
-                self.func_indices[name] = len(self.import_section) - 1
+                self.func_indices[symbol] = len(self.import_section) - 1
         
         # 2. Assign indices to declared functions
-        for name, decl in self.resolver.functions.items():
+        for name, decl in iter_all_functions(self.resolver.functions):
             is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
-            if is_import:
+            if is_import or name == 'input':
                 continue
+            symbol = ensure_mangled_name(decl)
             params = [TYPE_I32] * len(decl.params)
             ret = []
             if decl.ret_type:
@@ -127,20 +134,20 @@ class WASMEmitter:
                 if ret_t and not (isinstance(ret_t, PrimitiveResolvedType) and ret_t.name == 'void'):
                     ret = [TYPE_I32]
             t_idx = self.add_type_signature(params, ret)
-            self.func_indices[name] = len(self.import_section) + len(self.func_section)
+            self.func_indices[symbol] = len(self.import_section) + len(self.func_section)
             self.func_section.append(encode_leb128(t_idx))
 
         # 3. Compile function bodies
-        for name, decl in self.resolver.functions.items():
+        for name, decl in iter_all_functions(self.resolver.functions):
             is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
-            if decl.kind in ['normal', 'server', 'external'] and not is_import:
+            if decl.kind in ['normal', 'server', 'external'] and not is_import and name != 'input':
                 body_bytes = self.compile_function(decl)
                 self.code_section.append(body_bytes)
                 
-            # Export main/external entry points
+            symbol = ensure_mangled_name(decl)
             if decl.name in ['main', 'app_entry'] or (decl.kind == 'external' and not is_import):
                 self.export_section.append(
-                    encode_string(decl.name) + b'\x00' + encode_leb128(self.func_indices[decl.name])
+                    encode_string(decl.name) + b'\x00' + encode_leb128(self.func_indices[symbol])
                 )
 
         # 4. Build the final WASM file bytes
@@ -161,8 +168,72 @@ class WASMEmitter:
         self.func_indices[field] = len(self.import_section)
         self.import_section.append(imp)
 
+    def _function_has_tail_calls(self, func):
+        func_symbol = ensure_mangled_name(func)
+
+        def is_tail_call(expr):
+            if not isinstance(expr, CallExpr) or not isinstance(expr.func, Identifier):
+                return False
+            if expr.func.name != func.name:
+                return False
+            resolution = self.resolver.resolved_calls.get(id(expr))
+            if resolution:
+                return ensure_mangled_name(resolution["decl"]) == func_symbol
+            overloads = get_overloads(self.resolver.functions, func.name)
+            if len(overloads) > 1:
+                return False
+            return len(expr.args) == len(func.params)
+
+        def visit_stmt(stmt):
+            if isinstance(stmt, ReturnStmt) and stmt.expr and is_tail_call(stmt.expr):
+                return True
+            if isinstance(stmt, IfStmt):
+                return any(visit_stmt(s) for s in stmt.then_branch) or any(
+                    visit_stmt(s) for s in stmt.else_branch
+                )
+            if isinstance(stmt, ForStmt):
+                return any(visit_stmt(s) for s in stmt.body)
+            if isinstance(stmt, MatchStmt):
+                return any(visit_stmt(s) for case in stmt.cases for s in case.body)
+            return False
+
+        return any(visit_stmt(stmt) for stmt in func.body)
+
+    def _is_tail_call(self, expr):
+        if not self.current_compiling_func_decl:
+            return False
+        if not isinstance(expr, CallExpr):
+            return False
+        if not isinstance(expr.func, Identifier):
+            return False
+        if expr.func.name != self.current_compiling_func_decl.name:
+            return False
+        resolution = self.resolver.resolved_calls.get(id(expr))
+        if resolution:
+            return (
+                ensure_mangled_name(resolution["decl"])
+                == ensure_mangled_name(self.current_compiling_func_decl)
+            )
+        overloads = get_overloads(self.resolver.functions, expr.func.name)
+        if len(overloads) > 1:
+            return False
+        return len(expr.args) == len(self.current_compiling_func_decl.params)
+
+    def _call_symbol(self, func_name, expr):
+        resolution = self.resolver.resolved_calls.get(id(expr))
+        if resolution:
+            return ensure_mangled_name(resolution["decl"])
+        overloads = get_overloads(self.resolver.functions, func_name)
+        for decl in overloads:
+            if len(decl.params) == len(expr.args):
+                return ensure_mangled_name(decl)
+        if len(overloads) == 1:
+            return ensure_mangled_name(overloads[0])
+        return func_name
+
     def compile_function(self, func):
-        self.resolver.locals = self.resolver.func_locals[func.name]
+        symbol = ensure_mangled_name(func)
+        self.resolver.locals = self.resolver.func_locals[symbol]
         self.wasm_locals = {}
         
         # Build local generic map for function's own generic parameters
@@ -186,9 +257,22 @@ class WASMEmitter:
             if name not in self.wasm_locals:
                 self.wasm_locals[name] = self.local_count
                 self.local_count += 1
+
+        self._scratch_local = self.local_count
+        self.local_count += 1
+        self._scratch_local2 = self.local_count
+        self.local_count += 1
                 
         # Instructions bytecode
         code = bytearray()
+        self.current_compiling_func = func.name
+        self.current_compiling_func_decl = func
+        use_tail_loop = self._function_has_tail_calls(func)
+        
+        if use_tail_loop:
+            # Tail-call loop: self-recursive tail calls branch here instead of growing the stack.
+            code.append(0x03) # loop
+            code.append(0x40) # void
         
         # Compile parameter constraints checks for 'main'
         if func.name == 'main':
@@ -226,8 +310,15 @@ class WASMEmitter:
         if has_ret:
             code.append(0x41) # i32.const
             code.extend(encode_sleb128(0))
+            if use_tail_loop:
+                code.append(0x0f) # return
             
-        code.append(0x0b) # End function body
+        if use_tail_loop:
+            code.append(0x0b) # end tail-call loop
+        else:
+            code.append(0x0b) # end function body expression
+        self.current_compiling_func = None
+        self.current_compiling_func_decl = None
         self.resolver.current_generic_map = {}
         
         # Local declarations vector
@@ -410,9 +501,23 @@ class WASMEmitter:
                 code.append(0x0b) # end if
                 
         elif isinstance(stmt, ReturnStmt):
-            if stmt.expr:
-                code.extend(self.compile_expr(stmt.expr))
-            code.append(0x0f) # WASM explicit return instruction
+            if stmt.expr and self._is_tail_call(stmt.expr):
+                resolution = self.resolver.resolved_calls.get(id(stmt.expr))
+                callee = (
+                    resolution["decl"]
+                    if resolution
+                    else self.current_compiling_func_decl
+                )
+                for i, arg in enumerate(stmt.expr.args):
+                    code.extend(self.compile_expr(arg))
+                    code.append(0x21) # local.set
+                    code.extend(encode_leb128(self.wasm_locals[callee.params[i].name]))
+                code.append(0x0c) # br 0 (tail-call loop)
+                code.extend(encode_leb128(0))
+            else:
+                if stmt.expr:
+                    code.extend(self.compile_expr(stmt.expr))
+                code.append(0x0f) # WASM explicit return instruction
             
         elif isinstance(stmt, ExprStmt):
             code.extend(self.compile_expr(stmt.expr))
@@ -427,6 +532,8 @@ class WASMEmitter:
 
     def compile_expr(self, expr):
         code = bytearray()
+        if isinstance(expr, StringLiteral):
+            return self.compile_expr(lower_string_literal(expr, len(expr.value)))
         if isinstance(expr, Literal):
             if expr.val_type == 'Integer':
                 code.append(0x41) # i32.const
@@ -459,23 +566,90 @@ class WASMEmitter:
                 code.append(0x28) # i32.load
                 code.extend(b'\x02\x00')
                 
+        elif isinstance(expr, UnaryExpr):
+            unop = self.resolver.resolved_unops.get(id(expr))
+            if unop:
+                code.extend(self.compile_expr(expr.operand))
+                f_idx = self.func_indices[ensure_mangled_name(unop["decl"])]
+                code.append(0x10)
+                code.extend(encode_leb128(f_idx))
+            elif expr.op == '!':
+                code.extend(self.compile_expr(expr.operand))
+                code.append(0x45)  # i32.eqz
+
         elif isinstance(expr, BinaryExpr):
-            code.extend(self.compile_expr(expr.left))
-            code.extend(self.compile_expr(expr.right))
-            
-            if expr.op == '+': code.append(0x6a) # i32.add
-            elif expr.op == '-': code.append(0x6b) # i32.sub
-            elif expr.op == '*': code.append(0x6c) # i32.mul
-            elif expr.op == '/': code.append(0x6d) # i32.div_s
-            elif expr.op == '%': code.append(0x6f) # i32.rem_s
-            elif expr.op == '==': code.append(0x46) # i32.eq
-            elif expr.op == '!=': code.append(0x47) # i32.ne
-            elif expr.op == '<': code.append(0x48) # i32.lt_s
-            elif expr.op == '>': code.append(0x4a) # i32.gt_s
-            elif expr.op == '<=': code.append(0x4c) # i32.le_s
-            elif expr.op == '>=': code.append(0x4e) # i32.ge_s
-            elif expr.op == '&&': code.append(0x71) # i32.and
-            elif expr.op == '||': code.append(0x72) # i32.or
+            binop = self.resolver.resolved_binops.get(id(expr))
+            if binop:
+                for arg in (expr.left, expr.right):
+                    code.extend(self.compile_expr(arg))
+                f_idx = self.func_indices[ensure_mangled_name(binop["decl"])]
+                code.append(0x10)
+                code.extend(encode_leb128(f_idx))
+            else:
+                left_t = right_t = None
+                try:
+                    left_t = self.resolver.infer_expr_type(expr.left)
+                    right_t = self.resolver.infer_expr_type(expr.right)
+                except LatticeTypeError:
+                    pass
+                left_max = self.resolver._struct_string_max_len(left_t) if left_t else None
+                right_max = self.resolver._struct_string_max_len(right_t) if right_t else None
+                if left_max is not None and right_max is not None and expr.op == '+':
+                    out_addr = self.data_offset
+                    self.data_offset += left_t.get_size(self.resolver)
+                    code.extend(self.compile_expr(expr.left))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.extend(self.compile_expr(expr.right))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(left_max + right_max))
+                    f_idx = self.func_indices['concat_strings']
+                    code.append(0x10)
+                    code.extend(encode_leb128(f_idx))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
+                elif left_max is not None and right_max is not None and expr.op in ['==', '!=']:
+                    code.extend(self.compile_expr(expr.left))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.extend(self.compile_expr(expr.right))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    f_idx = self.func_indices['strings_equal']
+                    code.append(0x10)
+                    code.extend(encode_leb128(f_idx))
+                    if expr.op == '!=':
+                        code.append(0x45)
+                else:
+                    code.extend(self.compile_expr(expr.left))
+                    code.extend(self.compile_expr(expr.right))
+                    
+                    if expr.op == '+': code.append(0x6a)
+                    elif expr.op == '-': code.append(0x6b)
+                    elif expr.op == '*': code.append(0x6c)
+                    elif expr.op == '/': code.append(0x6d)
+                    elif expr.op == '%': code.append(0x6f)
+                    elif expr.op == '==': code.append(0x46)
+                    elif expr.op == '!=': code.append(0x47)
+                    elif expr.op == '<': code.append(0x48)
+                    elif expr.op == '>': code.append(0x4a)
+                    elif expr.op == '<=': code.append(0x4c)
+                    elif expr.op == '>=': code.append(0x4e)
+                    elif expr.op == '&&': code.append(0x71)
+                    elif expr.op == '||': code.append(0x72)
+                    elif expr.op == '^': code.append(0x73)
             
         elif isinstance(expr, IndexExpr):
             # Calculate address = base_address + index * element_size
@@ -521,7 +695,32 @@ class WASMEmitter:
             
         elif isinstance(expr, CallExpr):
             func_name = expr.func.name
-            if func_name in self.resolver.type_decls or func_name in self.resolver.types:
+            if func_name == 'input':
+                site_id = self.resolver.input_call_exprs.get(id(expr))
+                if site_id is None:
+                    raise RuntimeError("input(...) call was not registered during type checking")
+                out_site = self.resolver.input_call_sites[site_id]
+                out_t = out_site['resolved_type']
+                out_addr = self.data_offset
+                self.data_offset += out_t.get_size(self.resolver)
+
+                code.extend(self.compile_expr(expr.args[0]))
+                code.append(0x21)
+                code.extend(encode_leb128(self._scratch_local))
+
+                code.append(0x41)
+                code.extend(encode_sleb128(site_id))
+                code.append(0x20)
+                code.extend(encode_leb128(self._scratch_local))
+                code.append(0x41)
+                code.extend(encode_sleb128(out_addr))
+                f_idx = self.func_indices['input_typed']
+                code.append(0x10)
+                code.extend(encode_leb128(f_idx))
+
+                code.append(0x41)
+                code.extend(encode_sleb128(out_addr))
+            elif func_name in self.resolver.type_decls or func_name in self.resolver.types:
                 # Constructor!
                 struct_t = self.resolver.infer_expr_type(expr)
                 
@@ -574,7 +773,12 @@ class WASMEmitter:
                 for arg in expr.args:
                     arg_code = self.compile_expr(arg)
                     code.extend(arg_code)
-                f_idx = self.func_indices[func_name]
+                resolution = self.resolver.resolved_calls.get(id(expr))
+                if resolution:
+                    call_symbol = ensure_mangled_name(resolution["decl"])
+                else:
+                    call_symbol = self._call_symbol(func_name, expr)
+                f_idx = self.func_indices[call_symbol]
                 code.append(0x10) # call
                 code.extend(encode_leb128(f_idx))
             

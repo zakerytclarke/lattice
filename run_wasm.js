@@ -54,6 +54,154 @@ function formatParamUsage(params) {
     return ' ' + params.map((p) => `[${p.name}: ${p.type}]`).join(' ');
 }
 
+function formatParamUsage(params) {
+    if (params.length === 0) {
+        return '';
+    }
+    return ' ' + params.map((p) => `[${p.name}: ${p.type}]`).join(' ');
+}
+
+function readStringStruct(view, stringPtr) {
+    const len = view.getInt32(stringPtr, true);
+    const listPtr = view.getInt32(stringPtr + 4, true);
+    const charDataPtr = view.getInt32(listPtr, true);
+    let s = "";
+    for (let i = 0; i < len; i++) {
+        s += String.fromCodePoint(view.getInt32(charDataPtr + i * 4, true));
+    }
+    return s;
+}
+
+let stdinRemainder = "";
+
+function readStdinLine(fs) {
+    while (true) {
+        const match = stdinRemainder.match(/\r?\n/);
+        if (match) {
+            const idx = match.index;
+            const line = stdinRemainder.slice(0, idx);
+            stdinRemainder = stdinRemainder.slice(idx + match[0].length);
+            return line;
+        }
+        const buffer = Buffer.alloc(4096);
+        const bytesRead = fs.readSync(0, buffer, 0, 4096, null);
+        if (bytesRead === 0) {
+            if (stdinRemainder.length > 0) {
+                const line = stdinRemainder;
+                stdinRemainder = "";
+                return line;
+            }
+            throw new Error("unexpected end of input");
+        }
+        stdinRemainder += buffer.toString("utf8", 0, bytesRead);
+    }
+}
+
+function parseInputValue(schema, line) {
+    const trimmed = line.trim();
+    switch (schema.base) {
+        case 'Integer': {
+            const val = Number(trimmed);
+            if (trimmed === '' || !Number.isFinite(val) || !Number.isInteger(val)) {
+                throw new Error(`expected ${schema.type}, but got '${line}'`);
+            }
+            if (!constraintSatisfied(schema, val)) {
+                throw new Error(`value ${val} does not satisfy type ${schema.type}`);
+            }
+            return { kind: 'Integer', value: val };
+        }
+        case 'Bool': {
+            const lower = trimmed.toLowerCase();
+            if (lower === 'true' || lower === '1') {
+                return { kind: 'Bool', value: 1 };
+            }
+            if (lower === 'false' || lower === '0') {
+                return { kind: 'Bool', value: 0 };
+            }
+            throw new Error(`expected Bool, but got '${line}'`);
+        }
+        case 'String': {
+            const maxLen = schema.max_len;
+            if (trimmed.length > maxLen) {
+                throw new Error(`expected String(${maxLen}), but input length is ${trimmed.length}`);
+            }
+            return { kind: 'String', value: trimmed, maxLen };
+        }
+        case 'Rational': {
+            const parts = trimmed.split('/');
+            if (parts.length !== 2) {
+                throw new Error(`expected Rational as 'num/den', but got '${line}'`);
+            }
+            const num = Number(parts[0].trim());
+            const den = Number(parts[1].trim());
+            if (!Number.isInteger(num) || !Number.isInteger(den) || den === 0) {
+                throw new Error(`expected Rational as 'num/den' with non-zero denominator, but got '${line}'`);
+            }
+            return { kind: 'Rational', num, den };
+        }
+        case 'List': {
+            let parsed;
+            try {
+                parsed = JSON.parse(trimmed);
+            } catch (e) {
+                throw new Error(`expected JSON array for ${schema.type}, but got '${line}'`);
+            }
+            if (!Array.isArray(parsed)) {
+                throw new Error(`expected JSON array for ${schema.type}, but got '${line}'`);
+            }
+            if (parsed.length !== schema.length) {
+                throw new Error(`expected ${schema.type} with ${schema.length} elements, but got ${parsed.length}`);
+            }
+            const elems = parsed.map((item, idx) => {
+                const childSchema = { ...schema.elem, type: schema.elem.type || schema.elem.base };
+                return parseInputValue(schema.elem, String(item));
+            });
+            return { kind: 'List', elems, length: schema.length, elemSchema: schema.elem };
+        }
+        default:
+            throw new Error(`unsupported input type ${schema.type}`);
+    }
+}
+
+function writeStringValue(view, allocate, outPtr, value, maxLen) {
+    const finalLen = Math.min(value.length, maxLen);
+    view.setInt32(outPtr, finalLen, true);
+    const listPtr = allocate(4);
+    view.setInt32(outPtr + 4, listPtr, true);
+    const charDataPtr = allocate(maxLen * 4);
+    view.setInt32(listPtr, charDataPtr, true);
+    for (let i = 0; i < finalLen; i++) {
+        view.setInt32(charDataPtr + i * 4, value.codePointAt(i), true);
+    }
+}
+
+function writeInputValue(view, allocate, outPtr, parsed) {
+    switch (parsed.kind) {
+        case 'Integer':
+            view.setInt32(outPtr, parsed.value, true);
+            return;
+        case 'Bool':
+            view.setInt32(outPtr, parsed.value, true);
+            return;
+        case 'String':
+            writeStringValue(view, allocate, outPtr, parsed.value, parsed.maxLen);
+            return;
+        case 'Rational':
+            view.setInt32(outPtr, parsed.num, true);
+            view.setInt32(outPtr + 4, parsed.den, true);
+            return;
+        case 'List': {
+            const elemSize = parsed.elemSchema.base === 'Rational' ? 8 : 4;
+            for (let i = 0; i < parsed.length; i++) {
+                writeInputValue(view, allocate, outPtr + i * elemSize, parsed.elems[i]);
+            }
+            return;
+        }
+        default:
+            throw new Error(`unsupported parsed input kind ${parsed.kind}`);
+    }
+}
+
 function validateMainArgs(rawArgs, metadata) {
     if (!metadata || !metadata.main) {
         return rawArgs.map(Number);
@@ -265,31 +413,88 @@ function validateMainArgs(rawArgs, metadata) {
                 try {
                     const content = cp.execFileSync('curl', ['-s', '--max-time', '5', url], { encoding: 'utf8' });
                     const finalLen = Math.min(content.length, max_len);
-                    
-                    // Write Union tag (Some = 0)
                     mem[out_ptr] = 0;
-                    
-                    // Allocate String struct, List struct, and characters
                     const out_string_ptr = allocate(8);
                     const out_list_ptr = allocate(4);
                     const out_char_data_ptr = allocate(max_len * 4);
-                    
-                    // Write String pointer to Some variant Value field
                     view.setInt32(out_ptr + 1, out_string_ptr, true);
-                    // Write len to String len field
                     view.setInt32(out_string_ptr, finalLen, true);
-                    // Write List pointer to String data field
                     view.setInt32(out_string_ptr + 4, out_list_ptr, true);
-                    // Write Group pointer to List data field
                     view.setInt32(out_list_ptr, out_char_data_ptr, true);
-                    
-                    // Write character code points
                     for (let i = 0; i < finalLen; i++) {
                         view.setInt32(out_char_data_ptr + i * 4, content.codePointAt(i), true);
                     }
                 } catch (e) {
-                    mem[out_ptr] = 1; // None (tag 1)
+                    mem[out_ptr] = 1;
                 }
+            },
+            input_typed: function(call_id, prompt_ptr, out_ptr) {
+                const view = new DataView(exports.memory.buffer);
+                const schema = mainMetadata && mainMetadata.input_calls
+                    ? mainMetadata.input_calls.find((c) => c.id === call_id)
+                    : null;
+                if (!schema) {
+                    throw new Error(`unknown input call id ${call_id}`);
+                }
+                const prompt = readStringStruct(view, prompt_ptr);
+                for (;;) {
+                    process.stdout.write(prompt);
+                    let line;
+                    try {
+                        line = readStdinLine(fs);
+                    } catch (e) {
+                        throw new Error(`input at line ${schema.line}: ${e.message || e}`);
+                    }
+                    try {
+                        const parsed = parseInputValue(schema, line);
+                        writeInputValue(view, allocate, out_ptr, parsed);
+                        return;
+                    } catch (e) {
+                        process.stderr.write(`${e.message || e}\n`);
+                    }
+                }
+            },
+            concat_strings: function(out_ptr, a_ptr, b_ptr, max_out) {
+                const view = new DataView(exports.memory.buffer);
+                const a_len = view.getInt32(a_ptr, true);
+                const b_len = view.getInt32(b_ptr, true);
+                const total = a_len + b_len;
+                if (total > max_out) {
+                    throw new Error(`string concat length ${total} exceeds capacity ${max_out}`);
+                }
+                const a_list = view.getInt32(a_ptr + 4, true);
+                const a_chars = view.getInt32(a_list, true);
+                const b_list = view.getInt32(b_ptr + 4, true);
+                const b_chars = view.getInt32(b_list, true);
+                const out_list_ptr = allocate(4);
+                const out_char_ptr = allocate(max_out * 4);
+                view.setInt32(out_ptr, total, true);
+                view.setInt32(out_ptr + 4, out_list_ptr, true);
+                view.setInt32(out_list_ptr, out_char_ptr, true);
+                for (let i = 0; i < a_len; i++) {
+                    view.setInt32(out_char_ptr + i * 4, view.getInt32(a_chars + i * 4, true), true);
+                }
+                for (let i = 0; i < b_len; i++) {
+                    view.setInt32(out_char_ptr + (a_len + i) * 4, view.getInt32(b_chars + i * 4, true), true);
+                }
+            },
+            strings_equal: function(a_ptr, b_ptr) {
+                const view = new DataView(exports.memory.buffer);
+                const a_len = view.getInt32(a_ptr, true);
+                const b_len = view.getInt32(b_ptr, true);
+                if (a_len !== b_len) {
+                    return 0;
+                }
+                const a_list = view.getInt32(a_ptr + 4, true);
+                const a_chars = view.getInt32(a_list, true);
+                const b_list = view.getInt32(b_ptr + 4, true);
+                const b_chars = view.getInt32(b_list, true);
+                for (let i = 0; i < a_len; i++) {
+                    if (view.getInt32(a_chars + i * 4, true) !== view.getInt32(b_chars + i * 4, true)) {
+                        return 0;
+                    }
+                }
+                return 1;
             }
         }
     };

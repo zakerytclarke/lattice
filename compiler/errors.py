@@ -1,51 +1,168 @@
 # Lattice compiler error formatting and exception types
 
-from compiler.parser import (
-    BinaryExpr,
-    CallExpr,
-    FieldExpr,
-    Identifier,
-    IndexExpr,
-    Literal,
-    TypeExpr,
-)
+import re
+
+
+class LatticeSyntaxError(SyntaxError):
+    def __init__(self, message, line, column=1, hint=None):
+        self.message = message
+        self.line = line
+        self.column = column
+        self.hint = hint
+        self.file_name = None
+        self.source_lines = None
+        super().__init__(message)
+
+    def __str__(self):
+        return self.message
 
 
 class LatticeTypeError(Exception):
-    def __init__(self, message, line, hint=None):
+    def __init__(self, message, line, column=None, hint=None, span=1):
         self.message = message
         self.line = line
+        self.column = column
+        self.span = span
         self.hint = hint
+        self.file_name = None
+        self.source_lines = None
 
     def __str__(self):
-        text = f"Type Error at line {self.line}: {self.message}"
-        if self.hint:
-            text += f"\n  hint: {self.hint}"
-        return text
+        return self.message
 
 
 class SafetyError(Exception):
-    def __init__(self, message, line, hint=None):
+    def __init__(self, message, line, column=None, hint=None, span=1):
         self.message = message
         self.line = line
+        self.column = column
+        self.span = span
         self.hint = hint
+        self.file_name = None
+        self.source_lines = None
 
     def __str__(self):
-        text = f"Safety Error at line {self.line}: {self.message}"
-        if self.hint:
-            text += f"\n  hint: {self.hint}"
-        return text
+        return self.message
 
 
-def format_compilation_error(error, file_name=None):
-    file_name = file_name or getattr(error, 'file_name', None)
-    prefix = "Compilation Error"
+def _find_highlight(message, source_line):
+    quoted = re.findall(r"'([^']*)'", message)
+    for name in sorted(quoted, key=len, reverse=True):
+        if not name:
+            continue
+        idx = source_line.find(name)
+        if idx >= 0:
+            return idx + 1, len(name)
+    return None, 1
+
+
+def format_source_snippet(source_lines, line, column=None, span=1, message=None):
+    if not source_lines or line < 1 or line > len(source_lines):
+        return ""
+
+    src = source_lines[line - 1]
+    if column is None and message:
+        found_col, found_span = _find_highlight(message, src)
+        if found_col is not None:
+            column = found_col
+            span = found_span
+    column = column or 1
+    span = max(span, 1)
+
+    gutter = len(str(line))
+    lines = [
+        f"{' ' * gutter} |",
+        f"{line:>{gutter}} | {src}",
+        f"{' ' * gutter} | {' ' * (column - 1)}{'^' * span}",
+    ]
+    return "\n".join(lines)
+
+
+def _error_kind(error):
+    if isinstance(error, LatticeSyntaxError):
+        return "Syntax Error"
+    if isinstance(error, SafetyError):
+        return "Safety Error"
+    if isinstance(error, LatticeTypeError):
+        return "Type Error"
+    if isinstance(error, SyntaxError):
+        return "Syntax Error"
+    return "Error"
+
+
+def format_compilation_error(error, file_name=None, source_lines=None):
+    file_name = file_name or getattr(error, "file_name", None)
+    source_lines = source_lines or getattr(error, "source_lines", None)
+
+    line = getattr(error, "line", None)
+    if line is None and isinstance(error, SyntaxError):
+        line = getattr(error, "lineno", None)
+
+    column = getattr(error, "column", None)
+    if column is None and isinstance(error, SyntaxError):
+        column = getattr(error, "offset", None)
+
+    span = getattr(error, "span", 1)
+    message = getattr(error, "message", None) or str(error)
+    hint = getattr(error, "hint", None)
+    kind = _error_kind(error)
+
+    header = "Compilation Error"
     if file_name:
-        prefix += f" in {file_name}"
-    return f"{prefix}: {error}"
+        if line is not None and column is not None:
+            header += f" in {file_name}:{line}:{column}"
+        elif line is not None:
+            header += f" in {file_name}:{line}"
+        else:
+            header += f" in {file_name}"
+
+    parts = [header, "", f"{kind}: {message}"]
+
+    if line is not None:
+        snippet = format_source_snippet(source_lines, line, column, span, message)
+        if snippet:
+            parts.extend(["", snippet])
+
+    if hint:
+        parts.extend(["", f"  hint: {hint}"])
+
+    return "\n".join(parts)
+
+
+def error_site_from_expr(expr):
+    from compiler.parser import CallExpr, FieldExpr, Identifier
+
+    line = getattr(expr, "line", 0)
+    column = getattr(expr, "column", None)
+    span = 1
+    highlight = None
+
+    if isinstance(expr, CallExpr) and isinstance(expr.func, Identifier):
+        column = getattr(expr.func, "column", column)
+        highlight = expr.func.name
+        span = len(expr.func.name)
+    elif isinstance(expr, Identifier):
+        highlight = expr.name
+        span = len(expr.name)
+    elif isinstance(expr, FieldExpr):
+        column = getattr(expr, "column", column)
+        highlight = expr.field
+        span = len(expr.field)
+
+    return line, column, span
 
 
 def format_expr(expr):
+    from compiler.parser import (
+        BinaryExpr,
+        CallExpr,
+        FieldExpr,
+        Identifier,
+        IndexExpr,
+        Literal,
+        TypeExpr,
+    )
+
     if expr is None:
         return "<unknown>"
     if isinstance(expr, Literal):
@@ -72,8 +189,27 @@ def format_expr(expr):
 
 
 def format_type_expr(te):
+    from compiler.parser import Literal, TypeExpr
+
     if not te:
         return "void"
+
+    def format_size(size):
+        if isinstance(size, Literal):
+            return str(size.value)
+        if isinstance(size, TypeExpr):
+            return size.name
+        return str(size)
+
+    size_part = ""
+    if getattr(te, "size", None) is not None:
+        size_part = f"({format_size(te.size)})"
+
+    if te.name in ("List", "Group") and te.args:
+        return f"{te.name}{size_part}[{format_type_expr(te.args[0])}]"
+    if te.name == "String":
+        return f"String{size_part}" if size_part else "String"
+
     if te.args:
         parts = []
         for arg in te.args:
@@ -85,7 +221,9 @@ def format_type_expr(te):
                 parts.append(str(arg))
         base = f"{te.name}[{', '.join(parts)}]"
     else:
-        base = te.name
+        base = f"{te.name}{size_part}" if size_part else te.name
+        size_part = ""
+
     if getattr(te, 'constraint', None) is not None:
         var = getattr(te, 'constraint_var', 'x')
         return f"{base}({var}){{{format_expr(te.constraint)}}}"
@@ -96,11 +234,13 @@ def _format_struct_name(name):
     if name.startswith("String_"):
         suffix = name[len("String_"):]
         if suffix.isdigit():
-            return f"String[{suffix}]"
+            return f"String({suffix})"
     if name.startswith("List_"):
         parts = name[len("List_"):].split("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return f"List({parts[1]})[{parts[0]}]"
         if len(parts) == 2 and parts[0].isdigit():
-            return f"List[{parts[0]}, {parts[1]}]"
+            return f"List({parts[0]})[{parts[1]}]"
     if name.startswith("Some_"):
         return f"Some[{name[len('Some_'):]}]"
     if name.startswith("Input_"):
@@ -122,9 +262,10 @@ def format_type(resolved_type):
 
     if kind == 'ListResolvedType':
         length = resolved_type.length
+        elem = format_type(resolved_type.elem_type)
         if length is None:
-            length = "?"
-        return f"List[{length}, {format_type(resolved_type.elem_type)}]"
+            return f"List[{elem}]"
+        return f"List({length})[{elem}]"
 
     if kind == 'IOResolvedType':
         return f"IO[{format_type(resolved_type.inner)}]"
@@ -147,7 +288,7 @@ def format_type(resolved_type):
 def static_memory_hint():
     return (
         "Lattice has no heap or growable stack — every value needs a fixed size at compile time. "
-        "Specify capacities in types (e.g. List[5, Integer], String[64]) or pass explicit generics "
+        "Specify capacities in types (e.g. List(5)[Integer], String(64)) or pass explicit generics "
         "(e.g. read_file[1024, 256](path))."
     )
 

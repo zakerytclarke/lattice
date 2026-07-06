@@ -1,7 +1,7 @@
 external function main() {
-    let path: String[20] = String(15, List(['t', 'e', 's', 't', 's', '/', 'h', 'e', 'l', 'l', 'o', '.', 't', 'x', 't', 'a', 'b', 'c', 'd', 'e']));
+    let path: String(20) = "tests/hello.txt";
     
-    let content_opt: Input[String[20]] = read_file[20, 20](path);
+    let content_opt = read_file[20, 20](path);
     
     match (content_opt) {
         Some(content) => {

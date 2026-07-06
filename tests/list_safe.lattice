@@ -1,14 +1,14 @@
-function len[N: Integer, T: Type](list: List[N, T]) -> Integer {
+function len[T: Type, N: Integer](list: List(N)[T]) -> Integer {
     return N;
 }
 
-function get[N: Integer, T: Type](list: List[N, T], idx: Integer) -> T {
+function get[T: Type, N: Integer](list: List(N)[T], idx: Integer) -> T {
     idx >= 0 && idx < N;
 } {
     return list.data[idx];
 }
 
-function set[N: Integer, T: Type](let list: List[N, T], idx: Integer, val: T) -> List[N, T] {
+function set[T: Type, N: Integer](let list: List(N)[T], idx: Integer, val: T) -> List(N)[T] {
     idx >= 0 && idx < N;
 } {
     list.data[idx] = val;
@@ -16,17 +16,6 @@ function set[N: Integer, T: Type](let list: List[N, T], idx: Integer, val: T) ->
 }
 
 external function main(val) {
-    let my_list: List[5, Integer] = List([0, 0, 0, 0, 0]);
-    let current_len = 0;
-    
-    if (current_len < len(my_list)) {
-        my_list = set(my_list, current_len, val);
-        current_len = current_len + 1;
-    }
-    
-    if (current_len > 0) {
-        const first = get(my_list, 0);
-        return first;
-    }
-    return 0;
+    let my_list: List(5)[Integer] = List([0, 0, 0, 0, 0]);
+    return get(set(my_list, 0, val), 0);
 }

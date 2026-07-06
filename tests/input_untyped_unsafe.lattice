@@ -1,0 +1,4 @@
+external function main() {
+    let name = input("Enter Name:");
+    return 0;
+}

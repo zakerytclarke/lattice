@@ -1,11 +1,11 @@
-function get_char[MaxLen: Integer](s: String[MaxLen], idx: Integer) -> Char {
+function get_char[MaxLen: Integer](s: String(MaxLen), idx: Integer) -> Char {
     idx >= 0 && idx < s.len;
 } {
     return s.data.data[idx];
 }
 
 external function main() {
-    let s: String[5] = String(5, List(['h', 'e', 'l', 'l', 'o']));
+    let s: String(5) = "hello";
     const c1 = get_char(s, 0);
     const c2 = get_char(s, 4);
     return 0;

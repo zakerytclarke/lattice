@@ -1,0 +1,8 @@
+function sneaky() -> Integer {
+    print("hi");
+    return 42;
+}
+
+external function main() {
+    return sneaky();
+}

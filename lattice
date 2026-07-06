@@ -3,12 +3,39 @@
 # Lattice Compiler & Execution CLI Launcher
 
 if [ -z "$1" ]; then
-    echo "Usage: lattice <source_file.lattice> [args...]"
+    echo "Usage: lattice [--optimal] <source_file.lattice> [args...]"
     exit 1
 fi
 
 # Resolve directories relative to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+COMPILER_FLAGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --optimal)
+            COMPILER_FLAGS+=(--optimal)
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown flag: $1"
+            echo "Usage: lattice [--optimal] <source_file.lattice> [args...]"
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ -z "$1" ]; then
+    echo "Usage: lattice [--optimal] <source_file.lattice> [args...]"
+    exit 1
+fi
 
 # 1. Compile source to WASM
 # We compile to the build/ directory
@@ -16,7 +43,7 @@ FILENAME=$(basename "$1")
 BASENAME="${FILENAME%.*}"
 WASM_OUT="$SCRIPT_DIR/build/$BASENAME.wasm"
 
-python3 "$SCRIPT_DIR/compiler/main.py" "$1" "$WASM_OUT"
+python3 "$SCRIPT_DIR/compiler/main.py" "${COMPILER_FLAGS[@]}" "$1" "$WASM_OUT"
 COMPILE_STATUS=$?
 
 if [ $COMPILE_STATUS -ne 0 ]; then

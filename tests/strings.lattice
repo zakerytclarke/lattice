@@ -1,0 +1,31 @@
+type Email[MaxLen: Integer](len: Integer, data: List(MaxLen)[Char]) {
+    len >= 5 && len <= MaxLen
+}
+
+function get_char[MaxLen: Integer](s: String(MaxLen), idx: Integer) -> Char {
+    idx >= 0 && idx < s.len;
+} {
+    return s.data.data[idx];
+}
+
+function contains_char[MaxLen: Integer](s: String(MaxLen), ch: Char) -> Bool {
+    for i in 0..s.len {
+        if (get_char(s, i) == ch) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function is_valid_email[MaxLen: Integer](s: String(MaxLen)) -> Bool {
+    return contains_char(s, '@') && s.len >= 5;
+}
+
+external function main() {
+    let s1 = "hello ";
+    let raw: String(64) = input("Enter email: ");
+    if (is_valid_email(raw)) {
+        print(s1 + raw + "!");
+    }
+    return 0;
+}

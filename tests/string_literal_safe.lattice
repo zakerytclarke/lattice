@@ -1,0 +1,4 @@
+external function main() {
+    let s: String(5) = "hello";
+    return s.len;
+}

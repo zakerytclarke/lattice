@@ -82,6 +82,27 @@
     ]
   },
   {
+    "file": "string_literal_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": 5
+      }
+    ]
+  },
+  {
+    "file": "strings.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "stdin": "a@b.co\n",
+        "expected": "Enter email: hello a@b.co!0"
+      }
+    ]
+  },
+  {
     "file": "string_unsafe.lattice",
     "should_fail": true
   },
@@ -164,6 +185,10 @@
     "should_fail": true
   },
   {
+    "file": "let_reassign_unsafe.lattice",
+    "should_fail": true
+  },
+  {
     "file": "unresolved_generic_unsafe.lattice",
     "should_fail": true
   },
@@ -173,6 +198,14 @@
   },
   {
     "file": "arithmetic_call_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "io_in_pure_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "input_untyped_unsafe.lattice",
     "should_fail": true
   }
 ]

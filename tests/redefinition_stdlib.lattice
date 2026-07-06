@@ -1,4 +1,7 @@
-function print_string[MaxLen: Integer](s: String[MaxLen]) -> IO[void] {
+function print_string[MaxLen: Integer](s: String(MaxLen)) -> IO[void] {
+    return;
+}
+
+external function main() {
     return 0;
 }
-external function main() { return 0; }

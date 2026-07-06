@@ -12,6 +12,7 @@ from compiler.errors import (
     static_memory_hint,
 )
 from compiler.resolver import *
+from compiler.overloads import get_overloads, resolve_call, ensure_mangled_name
 
 class SMTVerifier:
     def __init__(self, resolver):
@@ -22,6 +23,17 @@ class SMTVerifier:
         self.variables = {}
         self.temp_count = 0
         self.current_func_name = None
+        self.current_func_decl = None
+
+    def _record_error(self, error):
+        if self.resolver.diagnostics:
+            self.resolver.diagnostics.add(
+                error,
+                file_name=self.resolver._current_file_name,
+                source_lines=self.resolver._current_source_lines,
+            )
+        else:
+            raise error
 
     def _require(self, z3_expr, description, line, hint=None):
         if z3_expr is None:
@@ -141,6 +153,14 @@ class SMTVerifier:
             if expr.op == '>=': return left >= right
             if expr.op == '&&': return z3.And(left, right)
             if expr.op == '||': return z3.Or(left, right)
+            if expr.op == '^': return z3.Xor(left, right)
+
+        if isinstance(expr, UnaryExpr):
+            operand = self.translate_expr(expr.operand, generic_map, local_var_map, local_type_map)
+            if operand is None:
+                return None
+            if expr.op == '!':
+                return z3.Not(operand)
 
         if isinstance(expr, FieldExpr):
             base = self.translate_expr(expr.expr, generic_map, local_var_map, local_type_map)
@@ -254,10 +274,17 @@ class SMTVerifier:
     def verify_program_safety(self, prog):
         for decl in prog.decls:
             if isinstance(decl, FuncDecl):
-                self.verify_function(decl)
+                try:
+                    self.verify_function(decl)
+                except SafetyError as e:
+                    self._record_error(e)
 
     def verify_function(self, func):
+        func_symbol = ensure_mangled_name(func)
+        if func_symbol not in self.resolver.func_locals:
+            return
         self.current_func_name = func.name
+        self.current_func_decl = func
         
         # Build local generic map for function's own generic parameters
         local_generic_map = {}
@@ -270,7 +297,7 @@ class SMTVerifier:
                     local_generic_map[gname] = None
         self.resolver.current_generic_map = local_generic_map
         
-        self.resolver.locals = self.resolver.func_locals[func.name]
+        self.resolver.locals = self.resolver.func_locals[ensure_mangled_name(func)]
         self.solver.push()
         
         # 1. Reset variable mappings for Z3
@@ -294,7 +321,15 @@ class SMTVerifier:
         self.resolver.current_generic_map = {}
 
     def verify_statement(self, stmt):
+        try:
+            self._verify_statement(stmt)
+        except SafetyError as e:
+            self._record_error(e)
+
+    def _verify_statement(self, stmt):
         if isinstance(stmt, VarDecl):
+            if stmt.name not in self.resolver.locals:
+                return
             # Verify expression contents first
             self.verify_expr_safety(stmt.value, stmt.line)
             # Assert variable equality if it can be represented
@@ -392,7 +427,7 @@ class SMTVerifier:
                 self.verify_expr_safety(stmt.expr, stmt.line)
                 
                 # Check return type constraint
-                func_decl = self.resolver.functions[self.current_func_name]
+                func_decl = self.current_func_decl
                 if func_decl.ret_type:
                     ret_t = self.resolver.resolve_type_expr(func_decl.ret_type)
                     if isinstance(ret_t, IOResolvedType):
@@ -507,7 +542,10 @@ class SMTVerifier:
         return False
 
     def verify_expr_safety(self, expr, line):
-        if isinstance(expr, BinaryExpr):
+        if isinstance(expr, UnaryExpr):
+            self.verify_expr_safety(expr.operand, line)
+
+        elif isinstance(expr, BinaryExpr):
             self.verify_expr_safety(expr.left, line)
             self.verify_expr_safety(expr.right, line)
             # Prevent division by zero
@@ -544,35 +582,20 @@ class SMTVerifier:
                 self.verify_expr_safety(arg, line)
                 
             func_name = expr.func.name
-            
+
+            if func_name == "input":
+                return
+
             # 1. Parameter constraint verification for normal function calls at call site
-            if func_name in self.resolver.functions:
-                callee_decl = self.resolver.functions[func_name]
-                call_generic_map = {}
-                if callee_decl.generics:
-                    for gname, _ in callee_decl.generics:
-                        call_generic_map[gname] = None
-                    if expr.generic_args:
-                        for i, (gname, _) in enumerate(callee_decl.generics):
-                            if i < len(expr.generic_args):
-                                call_generic_map[gname] = expr.generic_args[i]
-                    else:
-                        for idx, arg in enumerate(expr.args):
-                            if idx < len(callee_decl.params):
-                                arg_t = self.resolver.infer_expr_type(arg)
-                                self.resolver.infer_call_generics(callee_decl.params[idx].type_expr, arg_t, call_generic_map)
-                                
-                    for gname, gtype_expr in callee_decl.generics:
-                        if call_generic_map[gname] is None:
-                            gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
-                            if gtype_name == 'Type':
-                                call_generic_map[gname] = self.resolver.types['Integer']
-                            else:
-                                raise SafetyError(
-                                    f"Cannot infer generic parameter '{gname}' for call to '{func_name}'",
-                                    line,
-                                    hint=generic_inference_hint(func_name, callee_decl.generics, call_generic_map),
-                                )
+            if get_overloads(self.resolver.functions, func_name):
+                resolution = self.resolver.resolved_calls.get(id(expr))
+                if resolution:
+                    callee_decl = resolution["decl"]
+                    call_generic_map = resolution["generic_map"]
+                else:
+                    callee_decl, call_generic_map = resolve_call(
+                        self.resolver, func_name, expr, self.resolver.current_generic_map
+                    )
                                 
                 for idx, param in enumerate(callee_decl.params):
                     if idx < len(expr.args):
@@ -643,9 +666,20 @@ class SMTVerifier:
                                 ),
                             )
                                         
-            # 2. Recursive call termination checks
-            if func_name == self.current_func_name:
-                func_decl = self.resolver.functions[func_name]
+            # 2. Recursive call termination checks (same overload only)
+            resolution = self.resolver.resolved_calls.get(id(expr))
+            same_overload = False
+            if func_name == self.current_func_name and self.current_func_decl is not None:
+                if resolution:
+                    same_overload = (
+                        ensure_mangled_name(resolution["decl"])
+                        == ensure_mangled_name(self.current_func_decl)
+                    )
+                else:
+                    overloads = get_overloads(self.resolver.functions, func_name)
+                    same_overload = len(overloads) == 1
+            if same_overload:
+                func_decl = self.current_func_decl
                 decrease_proven = False
                 for idx, param in enumerate(func_decl.params):
                     param_t = self.resolver.resolve_type_expr(param.type_expr)
@@ -654,10 +688,13 @@ class SMTVerifier:
                         z3_arg = self.translate_expr(expr.args[idx])
                         z3_param = self.get_z3_var(param.name, param_t)
                         if z3_arg is not None and z3_param is not None:
-                            self.solver.push()
-                            self.solver.add(z3.Not(z3_arg < z3_param))
-                            res = self.solver.check()
-                            self.solver.pop()
+                            try:
+                                self.solver.push()
+                                self.solver.add(z3.Not(z3_arg < z3_param))
+                                res = self.solver.check()
+                                self.solver.pop()
+                            except Exception:
+                                res = z3.unknown
                             if res == z3.unsat:
                                 # Also check if the argument is bounded below (e.g. z3_arg >= 0)
                                 self.solver.push()

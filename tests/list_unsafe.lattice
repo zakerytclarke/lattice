@@ -1,8 +1,14 @@
-function len[N: Integer, T: Type](list: List[N, T]) -> Integer {
+function len[T: Type, N: Integer](list: List(N)[T]) -> Integer {
     return N;
 }
 
-function set[N: Integer, T: Type](let list: List[N, T], idx: Integer, val: T) -> List[N, T] {
+function get[T: Type, N: Integer](list: List(N)[T], idx: Integer) -> T {
+    idx >= 0 && idx < N;
+} {
+    return list.data[idx];
+}
+
+function set[T: Type, N: Integer](let list: List(N)[T], idx: Integer, val: T) -> List(N)[T] {
     idx >= 0 && idx < N;
 } {
     list.data[idx] = val;
@@ -10,10 +16,9 @@ function set[N: Integer, T: Type](let list: List[N, T], idx: Integer, val: T) ->
 }
 
 external function main(val) {
-    let my_list: List[5, Integer] = List([0, 0, 0, 0, 0]);
+    let my_list: List(5)[Integer] = List([0, 0, 0, 0, 0]);
     let current_len = 5;
     
     // Unsafe: setting at index 5 on a list of capacity 5
-    my_list = set(my_list, current_len, val);
-    return current_len;
+    return get(set(my_list, current_len, val), 0);
 }
