@@ -1,0 +1,15 @@
+type StrSlice(start: Integer, len: Integer)
+
+type User(
+    name: StrSlice,
+    email: StrSlice,
+    phone: StrSlice,
+    age: Integer,
+    birthdate: StrSlice
+)
+
+external function main() {
+    let path: String(40) = "tests/sample_users.json";
+    let users: List(100)[User] = read_file(path);
+    return 0;
+}

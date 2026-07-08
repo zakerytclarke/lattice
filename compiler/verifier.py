@@ -586,6 +586,12 @@ class SMTVerifier:
             if func_name == "input":
                 return
 
+            if func_name == "read_file":
+                return
+
+            if func_name == "http_get":
+                return
+
             # 1. Parameter constraint verification for normal function calls at call site
             if get_overloads(self.resolver.functions, func_name):
                 resolution = self.resolver.resolved_calls.get(id(expr))
@@ -684,7 +690,7 @@ class SMTVerifier:
                 for idx, param in enumerate(func_decl.params):
                     param_t = self.resolver.resolve_type_expr(param.type_expr)
                     base_t = param_t.base_type if isinstance(param_t, RefinedResolvedType) else param_t
-                    if base_t and base_t.name == 'Integer' and idx < len(expr.args):
+                    if base_t and getattr(base_t, 'name', None) == 'Integer' and idx < len(expr.args):
                         z3_arg = self.translate_expr(expr.args[idx])
                         z3_param = self.get_z3_var(param.name, param_t)
                         if z3_arg is not None and z3_param is not None:

@@ -6,7 +6,12 @@ import os
 # Add current project root to python path to resolve local imports cleanly
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from compiler.parser import parse_code, Literal, Identifier, BinaryExpr, FieldExpr, ImportDecl, FuncDecl, TypeDecl, UnionTypeDecl, Param, TypeExpr
+from compiler.parser import (
+    parse_code, Literal, Identifier, BinaryExpr, FieldExpr, ImportDecl,
+    FuncDecl, TypeDecl, UnionTypeDecl, Param, TypeExpr,
+    CallExpr, UnaryExpr, IndexExpr, ListLiteral, MapLiteral, StructLiteral,
+    VarDecl, Assign, IfStmt, ForStmt, MatchStmt, ReturnStmt, ExprStmt,
+)
 from compiler.errors import LatticeTypeError, LatticeSyntaxError, SafetyError, format_compilation_error
 from compiler.resolver import Resolver
 from compiler.verifier import SMTVerifier
@@ -15,7 +20,7 @@ from compiler.stdlib import STDLIB_CODE
 from compiler.entry_metadata import write_main_metadata
 from compiler.input_metadata import write_program_metadata
 from compiler.diagnostics import CompilationDiagnostics
-from compiler.type_debug import print_type_report
+from compiler.type_debug import print_inspect_report
 from compiler.overloads import (
     register_function,
     merge_function_maps,
@@ -24,6 +29,177 @@ from compiler.overloads import (
     function_signature_key,
     ensure_mangled_name,
 )
+
+
+PRINTABLE_PRIMITIVES = {"Integer", "Rational", "Bool", "Char", "String"}
+
+
+def _field_type_is_printable(type_expr, struct_names):
+    if type_expr is None:
+        return False
+    name = getattr(type_expr, "name", None)
+    if name in PRINTABLE_PRIMITIVES:
+        return True
+    if name in struct_names:
+        return True
+    return False
+
+
+def generate_naive_prints(ast):
+    """For every non-generic user struct without a hand-written print overload,
+    synthesize a naive print(x: Type) that renders the type's syntax. Any
+    user-declared print(x: Type) takes precedence and suppresses generation."""
+    struct_decls = [
+        d for d in ast.decls
+        if isinstance(d, TypeDecl) and not getattr(d, "generics", None)
+    ]
+    struct_names = {d.name for d in struct_decls}
+
+    user_printed = set()
+    for d in ast.decls:
+        if isinstance(d, FuncDecl) and d.name == "print" and len(d.params) == 1:
+            p_type = getattr(d.params[0].type_expr, "name", None)
+            if p_type:
+                user_printed.add(p_type)
+
+    snippets = []
+    for decl in struct_decls:
+        if decl.name in user_printed:
+            continue
+        if not all(_field_type_is_printable(ft, struct_names) for _, ft in decl.fields):
+            continue
+        lines = [f"function print(__self: {decl.name}) -> IO[void] {{"]
+        lines.append(f'    print("{decl.name}(");')
+        for i, (fname, _ftype) in enumerate(decl.fields):
+            if i > 0:
+                lines.append('    print(", ");')
+            lines.append(f'    print("{fname}: ");')
+            lines.append(f"    print(__self.{fname});")
+        lines.append('    print(")");')
+        lines.append("}")
+        snippets.append("\n".join(lines))
+
+    if not snippets:
+        return
+
+    generated_ast = parse_code("\n\n".join(snippets))
+    for gen_decl in generated_ast.decls:
+        if isinstance(gen_decl, FuncDecl):
+            gen_decl.is_generated_print = True
+            ast.decls.append(gen_decl)
+
+
+def _iter_body_call_exprs(body):
+    """Yield every CallExpr appearing in a list of statements (recursively)."""
+    calls = []
+
+    def ve(e):
+        if isinstance(e, CallExpr):
+            calls.append(e)
+            for a in e.args:
+                ve(a)
+        elif isinstance(e, BinaryExpr):
+            ve(e.left)
+            ve(e.right)
+        elif isinstance(e, UnaryExpr):
+            ve(e.operand)
+        elif isinstance(e, IndexExpr):
+            ve(e.expr)
+            ve(e.index)
+        elif isinstance(e, FieldExpr):
+            ve(e.expr)
+        elif isinstance(e, ListLiteral):
+            for el in e.elements:
+                ve(el)
+        elif isinstance(e, MapLiteral):
+            for _k, v in e.entries:
+                ve(v)
+        elif isinstance(e, StructLiteral):
+            for _k, v in e.fields:
+                ve(v)
+
+    def vs(s):
+        if isinstance(s, VarDecl):
+            ve(s.value)
+        elif isinstance(s, Assign):
+            ve(s.target)
+            ve(s.value)
+        elif isinstance(s, IfStmt):
+            ve(s.cond)
+            for x in s.then_branch:
+                vs(x)
+            for x in s.else_branch:
+                vs(x)
+        elif isinstance(s, ForStmt):
+            ve(s.start)
+            ve(s.end)
+            for x in s.body:
+                vs(x)
+        elif isinstance(s, MatchStmt):
+            ve(s.expr)
+            for case in s.cases:
+                for x in case.body:
+                    vs(x)
+        elif isinstance(s, ReturnStmt):
+            if s.expr:
+                ve(s.expr)
+        elif isinstance(s, ExprStmt):
+            ve(s.expr)
+
+    for s in body or []:
+        vs(s)
+    return calls
+
+
+def prune_unused_generated_prints(loader, resolver):
+    """Remove auto-generated print(T) overloads that are never reached from
+    hand-written code, so we only synthesize prints for datatypes actually
+    printed. Reachability follows the resolved call graph, so a struct print
+    used only indirectly (e.g. via another struct's field print) is kept."""
+    generated = []
+    for _abs_path, (mod_ast, _mr) in loader.modules.items():
+        for d in mod_ast.decls:
+            if isinstance(d, FuncDecl) and getattr(d, "is_generated_print", False):
+                generated.append(d)
+    if not generated:
+        return
+    gen_ids = {id(d) for d in generated}
+
+    all_decls = [d for _, d in iter_all_functions(resolver.functions)]
+
+    def callees_of(decl):
+        result = []
+        for call in _iter_body_call_exprs(decl.body or []):
+            info = resolver.resolved_calls.get(id(call))
+            if info and info.get("decl") is not None:
+                result.append(info["decl"])
+        return result
+
+    used = set()
+    seen = set()
+    queue = [d for d in all_decls if id(d) not in gen_ids]
+    seen.update(id(d) for d in queue)
+    while queue:
+        decl = queue.pop()
+        for callee in callees_of(decl):
+            if id(callee) in gen_ids:
+                used.add(id(callee))
+            if id(callee) not in seen:
+                seen.add(id(callee))
+                queue.append(callee)
+
+    unused_ids = {id(d) for d in generated if id(d) not in used}
+    if not unused_ids:
+        return
+
+    for _abs_path, (mod_ast, _mr) in loader.modules.items():
+        mod_ast.decls = [d for d in mod_ast.decls if id(d) not in unused_ids]
+
+    for name in list(resolver.functions.keys()):
+        overloads = get_overloads(resolver.functions, name)
+        filtered = [d for d in overloads if id(d) not in unused_ids]
+        if len(filtered) != len(overloads):
+            resolver.functions[name] = filtered
 
 
 def register_input_function(resolver):
@@ -127,7 +303,10 @@ class ModuleLoader:
             err.file_name = os.path.basename(abs_path)
             err.source_lines = self.sources[abs_path]
             raise err
-            
+
+        # Synthesize naive print overloads for user struct types.
+        generate_naive_prints(ast)
+
         # Parse imports first
         imports = [d for d in ast.decls if isinstance(d, ImportDecl)]
         
@@ -219,17 +398,17 @@ class ModuleLoader:
 
 def parse_compiler_args(argv):
     args = list(argv)
-    optimal = False
+    inspect = False
     while args and args[0].startswith("--"):
-        if args[0] == "--optimal":
-            optimal = True
+        if args[0] in ("--inspect", "--optimal"):
+            inspect = True
             args.pop(0)
         else:
             print(f"Error: Unknown compiler flag '{args[0]}'")
             sys.exit(1)
 
     if not args:
-        print("Usage: python3 compiler/main.py [--optimal] <source_file.lattice> [output_file.wasm]")
+        print("Usage: python3 compiler/main.py [--inspect] <source_file.lattice> [output_file.wasm]")
         sys.exit(1)
 
     source_path = args[0]
@@ -242,11 +421,19 @@ def parse_compiler_args(argv):
         basename = os.path.basename(source_path).replace(".lattice", ".wasm")
         output_path = os.path.join(build_dir, basename)
 
-    return optimal, source_path, output_path
+    return inspect, source_path, output_path
+
+
+def _maybe_print_inspect(inspect, loader, source_path, resolver, emitter=None):
+    if inspect and resolver is not None:
+        print_inspect_report(
+            resolver, loader, source_path, stdlib_ast, emitter=emitter
+        )
+        print()
 
 
 def main():
-    optimal, source_path, output_path = parse_compiler_args(sys.argv[1:])
+    inspect, source_path, output_path = parse_compiler_args(sys.argv[1:])
         
     # Make sure output directory exists
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -272,13 +459,7 @@ def main():
         sys.exit(1)
 
     if diagnostics.has_errors():
-        if optimal and main_resolver is not None and main_ast is not None:
-            print_type_report(
-                main_resolver,
-                main_ast.decls,
-                os.path.basename(source_path),
-            )
-            print()
+        _maybe_print_inspect(inspect, loader, source_path, main_resolver)
         print(diagnostics.format_all())
         sys.exit(1)
         
@@ -321,13 +502,7 @@ def main():
                 )
 
     if diagnostics.has_errors():
-        if optimal:
-            print_type_report(
-                main_resolver,
-                main_ast.decls,
-                os.path.basename(source_path),
-            )
-            print()
+        _maybe_print_inspect(inspect, loader, source_path, main_resolver)
         print(diagnostics.format_all())
         sys.exit(1)
         
@@ -380,35 +555,32 @@ def main():
                 )
 
     if diagnostics.has_errors():
-        if optimal:
-            print_type_report(
-                main_resolver,
-                main_ast.decls,
-                os.path.basename(source_path),
-            )
-            print()
+        _maybe_print_inspect(inspect, loader, source_path, main_resolver)
         print(diagnostics.format_all())
         sys.exit(1)
 
-    if optimal:
-        print_type_report(
-            main_resolver,
-            main_ast.decls,
-            os.path.basename(source_path),
-        )
-        print()
-    
+    prune_unused_generated_prints(loader, main_resolver)
+
     emitter = WASMEmitter(main_resolver)
     try:
         wasm_bytes = emitter.compile(main_ast)
     except Exception as e:
         print(f"Compilation/WASM Emission Error: {e}")
         sys.exit(1)
+
+    _maybe_print_inspect(inspect, loader, source_path, main_resolver, emitter=emitter)
         
     with open(output_path, "wb") as f:
         f.write(wasm_bytes)
 
-    write_program_metadata(main_decl, main_resolver.input_call_sites, output_path)
+    write_program_metadata(
+        main_decl,
+        main_resolver.input_call_sites,
+        output_path,
+        main_resolver.read_file_call_sites,
+        main_resolver.http_get_call_sites,
+        main_resolver.main_input_args,
+    )
 
 
 if __name__ == "__main__":

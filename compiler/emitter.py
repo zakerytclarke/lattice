@@ -72,6 +72,20 @@ class WASMEmitter:
         self.local_count = 0
         self.data_offset = 1024   # Start static data after memory offset 1024
 
+    def _wasm_param_slots(self, decl):
+        slots = []
+        for param in decl.params:
+            if decl.name == 'main' and param.name in self.resolver.memory_locals:
+                continue
+            slots.append((param.name, 'val'))
+        return slots
+
+    def _wasm_params(self, decl):
+        return [param for param in decl.params if not (decl.name == 'main' and param.name in self.resolver.memory_locals)]
+
+    def _wasm_param_count(self, decl):
+        return len(self._wasm_param_slots(decl))
+
     def compile(self, prog):
         # Export memory to JS
         self.export_section.append(encode_string("memory") + b'\x02\x00')
@@ -81,6 +95,10 @@ class WASMEmitter:
         for name, decl in iter_all_functions(self.resolver.functions):
             is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
             if name == 'input':
+                continue
+            if name == 'read_file':
+                continue
+            if name == 'http_get':
                 continue
             symbol = ensure_mangled_name(decl)
             if is_import:
@@ -110,10 +128,10 @@ class WASMEmitter:
         # 2. Assign indices to declared functions
         for name, decl in iter_all_functions(self.resolver.functions):
             is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
-            if is_import or name == 'input':
+            if is_import or name == 'input' or name == 'read_file' or name == 'http_get':
                 continue
             symbol = ensure_mangled_name(decl)
-            params = [TYPE_I32] * len(decl.params)
+            params = [TYPE_I32] * self._wasm_param_count(decl)
             ret = []
             if decl.ret_type:
                 temp_generic_map = {}
@@ -140,7 +158,7 @@ class WASMEmitter:
         # 3. Compile function bodies
         for name, decl in iter_all_functions(self.resolver.functions):
             is_import = (decl.kind == 'external') and (len(decl.body) == 0 or name == 'print_int')
-            if decl.kind in ['normal', 'server', 'external'] and not is_import and name != 'input':
+            if decl.kind in ['normal', 'server', 'external'] and not is_import and name not in ('input', 'read_file', 'http_get'):
                 body_bytes = self.compile_function(decl)
                 self.code_section.append(body_bytes)
                 
@@ -239,18 +257,24 @@ class WASMEmitter:
         # Build local generic map for function's own generic parameters
         local_generic_map = {}
         if func.generics:
+            bound = getattr(func, 'monomorph_generics', None) or {}
             for gname, gtype_expr in func.generics:
                 gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
-                if gtype_name == 'Type':
+                if gname in bound:
+                    local_generic_map[gname] = bound[gname]
+                elif gtype_name == 'Type':
                     local_generic_map[gname] = self.resolver.types['Integer']
                 else:
                     local_generic_map[gname] = EMITTER_GENERIC_PLACEHOLDER
         self.resolver.current_generic_map = local_generic_map
 
         # Parameters occupy local indices starting from 0
-        for i, param in enumerate(func.params):
-            self.wasm_locals[param.name] = i
-        self.local_count = len(func.params)
+        wasm_param_idx = 0
+        for name, kind in self._wasm_param_slots(func):
+            self.wasm_locals[name] = wasm_param_idx
+            wasm_param_idx += 1
+        self.local_count = wasm_param_idx
+        self.rational_param_addrs = {}
         
         # Local variables map to subsequent local indices
         for name, (ltype, _) in self.resolver.locals.items():
@@ -262,6 +286,8 @@ class WASMEmitter:
         self.local_count += 1
         self._scratch_local2 = self.local_count
         self.local_count += 1
+        self._list_pad_to = None
+        self._list_elem_type = None
                 
         # Instructions bytecode
         code = bytearray()
@@ -274,29 +300,9 @@ class WASMEmitter:
             code.append(0x03) # loop
             code.append(0x40) # void
         
-        # Compile parameter constraints checks for 'main'
-        if func.name == 'main':
-            for i, param in enumerate(func.params):
-                param_t = self.resolver.resolve_type_expr(param.type_expr)
-                curr_t = param_t
-                while isinstance(curr_t, RefinedResolvedType):
-                    if curr_t.constraint:
-                        # Compile constraint check
-                        old_local_map = self.wasm_locals.copy()
-                        if curr_t.constraint_var:
-                            self.wasm_locals[curr_t.constraint_var] = i
-                        
-                        constraint_code = self.compile_expr(curr_t.constraint)
-                        self.wasm_locals = old_local_map
-                        
-                        code.extend(constraint_code)
-                        code.append(0x45) # i32.eqz
-                        code.append(0x04) # if
-                        code.append(0x40) # void block
-                        code.append(0x00) # unreachable
-                        code.append(0x0b) # end if
-                    curr_t = curr_t.base_type
-                    
+        # main() parameters are Input[T] values written into static memory by the
+        # runtime; any refinement on the inner type is enforced during parsing
+        # (a failed constraint yields None), so no in-WASM constraint check here.
         for stmt in func.body:
             code.extend(self.compile_statement(stmt))
             
@@ -322,7 +328,7 @@ class WASMEmitter:
         self.resolver.current_generic_map = {}
         
         # Local declarations vector
-        num_locals_to_declare = self.local_count - len(func.params)
+        num_locals_to_declare = self.local_count - self._wasm_param_count(func)
         local_decls = []
         if num_locals_to_declare > 0:
             local_decls.append(encode_leb128(num_locals_to_declare) + TYPE_I32)
@@ -333,20 +339,36 @@ class WASMEmitter:
     def compile_statement(self, stmt):
         code = bytearray()
         if isinstance(stmt, VarDecl):
-            # Evaluate initializer expression
-            code.extend(self.compile_expr(stmt.value))
+            self._list_pad_to = None
+            self._list_elem_type = None
+            if stmt.type_expr:
+                declared = self.resolver.resolve_type_expr(
+                    stmt.type_expr, self.resolver.current_generic_map
+                )
+                if isinstance(declared, ListResolvedType) and declared.length is not None:
+                    self._list_pad_to = declared.length
+                    self._list_elem_type = declared.elem_type
+            if not isinstance(stmt.value, MapLiteral):
+                code.extend(self.compile_expr(stmt.value))
+            else:
+                code.append(0x41)
+                code.extend(encode_sleb128(0))
             # Store in local variable slot
             l_idx = self.wasm_locals[stmt.name]
             code.append(0x21) # local.set
             code.extend(encode_leb128(l_idx))
             
         elif isinstance(stmt, Assign):
-            # Target could be local variable or list memory write
+            # Target could be local variable, struct field, or list memory write
             if isinstance(stmt.target, Identifier):
                 code.extend(self.compile_expr(stmt.value))
                 l_idx = self.wasm_locals[stmt.target.name]
                 code.append(0x21) # local.set
                 code.extend(encode_leb128(l_idx))
+            elif isinstance(stmt.target, FieldExpr):
+                code.extend(self._compile_field_address(stmt.target))
+                code.extend(self.compile_expr(stmt.value))
+                code.extend(b'\x36\x02\x00')
             elif isinstance(stmt.target, IndexExpr):
                 # Calculate list indexing address: base_addr + index * elem_size
                 arr_t = self.resolver.infer_expr_type(stmt.target.expr)
@@ -475,23 +497,32 @@ class WASMEmitter:
                 # Bind match variables if any to memory offset or local
                 for arg_idx, arg in enumerate(case.pattern.args):
                     field_offset = 1
+                    bind_type = None
                     if variant_resolved_t:
                         for prev_idx in range(arg_idx):
                             if prev_idx < len(variant_resolved_t.fields):
                                 field_offset += variant_resolved_t.fields[prev_idx][1].get_size(self.resolver)
                             else:
                                 field_offset += 4
-                                
+                        if arg_idx < len(variant_resolved_t.fields):
+                            bind_type = variant_resolved_t.fields[arg_idx][1]
+
                     code.append(0x20) # local.get
                     code.extend(encode_leb128(temp_idx))
                     code.append(0x41) # offset of field
                     code.extend(encode_sleb128(field_offset))
                     code.append(0x6a) # add
-                    
-                    code.append(0x28) # i32.load
-                    code.extend(b'\x02\x00')
-                    
-                    # Store in local arg binding
+
+                    bind_address = (
+                        isinstance(bind_type, StructResolvedType)
+                        and not getattr(bind_type, "name", "").startswith("String_")
+                        and bind_type.name != "Rational"
+                        and not isinstance(bind_type, ListResolvedType)
+                    )
+                    if not bind_address:
+                        code.append(0x28) # i32.load
+                        code.extend(b'\x02\x00')
+
                     a_idx = self.wasm_locals[arg]
                     code.append(0x21) # local.set
                     code.extend(encode_leb128(a_idx))
@@ -530,6 +561,212 @@ class WASMEmitter:
                 
         return code
 
+    def _field_offset(self, struct_t, field_name):
+        if isinstance(struct_t, ListResolvedType):
+            if field_name == 'data':
+                return 0
+            raise RuntimeError(f"List has no field '{field_name}'")
+        field_offset = 0
+        for name, ftype in struct_t.fields:
+            if name == field_name:
+                return field_offset
+            field_offset += ftype.get_size(self.resolver)
+        raise RuntimeError(f"Struct has no field '{field_name}'")
+
+    def _compile_field_address(self, field_expr):
+        code = bytearray()
+        if isinstance(field_expr.expr, FieldExpr):
+            code.extend(self._compile_field_address(field_expr.expr))
+            struct_t = self.resolver.infer_expr_type(field_expr.expr)
+        elif isinstance(field_expr.expr, IndexExpr):
+            arr_t = self.resolver.infer_expr_type(field_expr.expr.expr)
+            elem_size = arr_t.elem_type.get_size(self.resolver)
+            code.extend(self.compile_expr(field_expr.expr.expr))
+            code.extend(self.compile_expr(field_expr.expr.index))
+            code.append(0x41)
+            code.extend(encode_sleb128(elem_size))
+            code.append(0x6c)
+            code.append(0x6a)
+            struct_t = arr_t.elem_type
+        else:
+            code.extend(self.compile_expr(field_expr.expr))
+            struct_t = self.resolver.infer_expr_type(field_expr.expr)
+
+        field_offset = self._field_offset(struct_t, field_expr.field)
+        code.append(0x41)
+        code.extend(encode_sleb128(field_offset))
+        code.append(0x6a)
+        return code
+
+    def _emit_struct_literal_to_memory(self, struct_t, expr, base_addr, code):
+        if not isinstance(expr, StructLiteral):
+            raise RuntimeError("expected struct literal for static map entry")
+        offset = 0
+        for (_fname, fexpr), (_pf, ftype) in zip(expr.fields, struct_t.fields):
+            blob = self._compile_time_serialize(fexpr)
+            field_size = ftype.get_size(self.resolver)
+            if len(blob) < field_size:
+                blob = blob + b'\x00' * (field_size - len(blob))
+            elif len(blob) > field_size:
+                blob = blob[:field_size]
+            for i in range(0, field_size, 4):
+                val = int.from_bytes(blob[i : i + 4], 'little', signed=True)
+                code.append(0x41)
+                code.extend(encode_sleb128(base_addr + offset + i))
+                code.append(0x41)
+                code.extend(encode_sleb128(val))
+                code.extend(b'\x36\x02\x00')
+            offset += field_size
+
+    def _compile_static_map_lookup(self, map_type, expr):
+        code = bytearray()
+        payload_size = map_type.value_type.get_size(self.resolver)
+        out_addr = self.data_offset
+        self.data_offset += payload_size + 1
+        matched_addr = self.data_offset
+        self.data_offset += 4
+
+        code.append(0x41)
+        code.extend(encode_sleb128(matched_addr))
+        code.append(0x41)
+        code.extend(encode_sleb128(0))
+        code.extend(b'\x36\x02\x00')
+
+        for key, val_expr in map_type.entries:
+            code.extend(self.compile_expr(expr.index))
+            code.append(0x21)
+            code.extend(encode_leb128(self._scratch_local))
+            key_lit = lower_string_literal(StringLiteral(key, expr.line), len(key))
+            code.extend(self.compile_expr(key_lit))
+            code.append(0x21)
+            code.extend(encode_leb128(self._scratch_local2))
+            code.append(0x20)
+            code.extend(encode_leb128(self._scratch_local))
+            code.append(0x20)
+            code.extend(encode_leb128(self._scratch_local2))
+            f_idx = self.func_indices['strings_equal']
+            code.append(0x10)
+            code.extend(encode_leb128(f_idx))
+            code.append(0x04)
+            code.append(0x40)
+            code.append(0x41)
+            code.extend(encode_sleb128(out_addr))
+            code.append(0x41)
+            code.extend(encode_sleb128(0))
+            code.extend(b'\x3a\x00\x00')
+            self._emit_struct_literal_to_memory(
+                map_type.value_type, val_expr, out_addr + 1, code
+            )
+            code.append(0x41)
+            code.extend(encode_sleb128(matched_addr))
+            code.append(0x41)
+            code.extend(encode_sleb128(1))
+            code.extend(b'\x36\x02\x00')
+            code.append(0x0b)
+
+        code.append(0x41)
+        code.extend(encode_sleb128(matched_addr))
+        code.append(0x28)
+        code.extend(b'\x02\x00')
+        code.append(0x45)
+        code.append(0x04)
+        code.append(0x40)
+        code.append(0x41)
+        code.extend(encode_sleb128(out_addr))
+        code.append(0x41)
+        code.extend(encode_sleb128(1))
+        code.extend(b'\x3a\x00\x00')
+        code.append(0x0b)
+
+        code.append(0x41)
+        code.extend(encode_sleb128(out_addr))
+        return code
+
+    def _emit_data_blob(self, blob):
+        addr = self.data_offset
+        self.data_section.append(
+            b'\x00\x41' + encode_sleb128(addr) + b'\x0b'
+            + encode_leb128(len(blob)) + bytes(blob)
+        )
+        self.data_offset += len(blob)
+        return addr
+
+    def _emit_static_string(self, s):
+        # Heap-style String struct: [len][listwrapper_ptr][chardata_ptr][chars...]
+        # laid out contiguously so run_wasm.js readStringStruct can read it.
+        chars = [ord(c) for c in s]
+        base = self.data_offset
+        blob = bytearray()
+        blob += len(chars).to_bytes(4, 'little', signed=True)
+        blob += (base + 8).to_bytes(4, 'little', signed=True)
+        blob += (base + 12).to_bytes(4, 'little', signed=True)
+        for c in chars:
+            blob += c.to_bytes(4, 'little', signed=True)
+        return self._emit_data_blob(blob)
+
+    def _emit_value_pointer(self, value_type, val_expr):
+        if (
+            self.resolver._struct_string_max_len(value_type) is not None
+            and isinstance(val_expr, StringLiteral)
+        ):
+            return self._emit_static_string(val_expr.value)
+        blob = self._compile_time_serialize(val_expr)
+        return self._emit_data_blob(blob)
+
+    def _emit_map_handle(self, map_type, want_keys):
+        # Materialize dictionary keys/values as a handle: [count][ptr...].
+        ptrs = []
+        for key, val_expr in map_type.entries:
+            if want_keys:
+                ptrs.append(self._emit_static_string(key))
+            else:
+                ptrs.append(self._emit_value_pointer(map_type.value_type, val_expr))
+        base = self.data_offset
+        blob = bytearray()
+        blob += len(map_type.entries).to_bytes(4, 'little', signed=True)
+        for p in ptrs:
+            blob += p.to_bytes(4, 'little', signed=True)
+        return self._emit_data_blob(blob)
+
+    def _compile_time_serialize(self, expr):
+        if isinstance(expr, Literal) and expr.val_type == 'Integer':
+            return expr.value.to_bytes(4, byteorder='little', signed=True)
+        if isinstance(expr, Literal) and expr.val_type == 'Char':
+            val = ord(expr.value) if isinstance(expr.value, str) else int(expr.value)
+            return val.to_bytes(4, byteorder='little', signed=True)
+        if isinstance(expr, Literal) and expr.val_type == 'Bool':
+            return (1 if expr.value else 0).to_bytes(4, byteorder='little', signed=True)
+        if isinstance(expr, CallExpr):
+            func_name = expr.func.name if isinstance(expr.func, Identifier) else ""
+            if func_name in self.resolver.type_decls or func_name in self.resolver.types:
+                struct_t = self.resolver.infer_expr_type(expr)
+                blob = bytearray()
+                for i, arg in enumerate(expr.args):
+                    if hasattr(struct_t, 'fields') and i < len(struct_t.fields):
+                        field_size = struct_t.fields[i][1].get_size(self.resolver)
+                        arg_bytes = self._compile_time_serialize(arg)
+                        if len(arg_bytes) < field_size:
+                            arg_bytes = arg_bytes + b'\x00' * (field_size - len(arg_bytes))
+                        elif len(arg_bytes) > field_size:
+                            arg_bytes = arg_bytes[:field_size]
+                        blob.extend(arg_bytes)
+                    else:
+                        blob.extend(self._compile_time_serialize(arg))
+                return bytes(blob)
+        if isinstance(expr, StructLiteral):
+            blob = bytearray()
+            struct_t = self.resolver.infer_expr_type(expr)
+            for (_fname, fexpr), (_pf, ftype) in zip(expr.fields, struct_t.fields):
+                field_size = ftype.get_size(self.resolver)
+                arg_bytes = self._compile_time_serialize(fexpr)
+                if len(arg_bytes) < field_size:
+                    arg_bytes = arg_bytes + b'\x00' * (field_size - len(arg_bytes))
+                elif len(arg_bytes) > field_size:
+                    arg_bytes = arg_bytes[:field_size]
+                blob.extend(arg_bytes)
+            return bytes(blob)
+        return int(0).to_bytes(4, byteorder='little', signed=True)
+
     def compile_expr(self, expr):
         code = bytearray()
         if isinstance(expr, StringLiteral):
@@ -547,6 +784,27 @@ class WASMEmitter:
                 code.extend(encode_sleb128(1 if expr.value else 0))
                 
         elif isinstance(expr, Identifier):
+            if expr.name in self.wasm_locals:
+                l_idx = self.wasm_locals[expr.name]
+                param_t = None
+                if self.current_compiling_func_decl:
+                    for param in self.current_compiling_func_decl.params:
+                        if param.name == expr.name and param.type_expr is not None:
+                            param_t = self.resolver.resolve_type_expr(param.type_expr)
+                            break
+                if param_t is not None and self.resolver._is_rational_type(param_t):
+                    code.append(0x20)
+                    code.extend(encode_leb128(l_idx))
+                    return code
+            if expr.name in getattr(self, 'rational_param_addrs', {}):
+                code.append(0x41)
+                code.extend(encode_sleb128(self.rational_param_addrs[expr.name]))
+                return code
+            if expr.name in self.resolver.memory_locals:
+                _ptype, offset = self.resolver.memory_locals[expr.name]
+                code.append(0x41)
+                code.extend(encode_sleb128(offset))
+                return code
             # Check if generic constant
             if expr.name in self.resolver.current_generic_map:
                 val = self.resolver.current_generic_map[expr.name]
@@ -616,6 +874,94 @@ class WASMEmitter:
                     code.extend(encode_leb128(f_idx))
                     code.append(0x41)
                     code.extend(encode_sleb128(out_addr))
+                elif (
+                    left_max is not None
+                    and expr.op == '+'
+                    and self.resolver._is_rational_type(right_t)
+                ):
+                    out_addr = self.data_offset
+                    self.data_offset += left_t.get_size(self.resolver)
+                    temp_addr = self.data_offset
+                    self.data_offset += 32 * 4 + 8
+                    code.extend(self.compile_expr(expr.left))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.extend(self.compile_expr(expr.right))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(temp_addr))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(32))
+                    f_idx = self.func_indices['rational_to_string_raw']
+                    code.append(0x10)
+                    code.extend(encode_leb128(f_idx))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(temp_addr))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(left_max + 32))
+                    f_idx = self.func_indices['concat_strings']
+                    code.append(0x10)
+                    code.extend(encode_leb128(f_idx))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
+                elif left_max is not None and expr.op == '+' and right_t.name == 'Integer':
+                    out_addr = self.data_offset
+                    self.data_offset += left_t.get_size(self.resolver)
+                    temp_addr = self.data_offset
+                    self.data_offset += 16 * 4 + 8
+                    code.extend(self.compile_expr(expr.left))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.extend(self.compile_expr(expr.right))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(temp_addr))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(16))
+                    f_idx = self.func_indices['integer_to_string_raw']
+                    code.append(0x10)
+                    code.extend(encode_leb128(f_idx))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(temp_addr))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(left_max + 16))
+                    f_idx = self.func_indices['concat_strings']
+                    code.append(0x10)
+                    code.extend(encode_leb128(f_idx))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
+                elif left_max is not None and right_max is not None and expr.op == '+':
+                    out_addr = self.data_offset
+                    self.data_offset += left_t.get_size(self.resolver)
+                    code.extend(self.compile_expr(expr.left))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.extend(self.compile_expr(expr.right))
+                    code.append(0x21)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local))
+                    code.append(0x20)
+                    code.extend(encode_leb128(self._scratch_local2))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(left_max + right_max))
+                    f_idx = self.func_indices['concat_strings']
+                    code.append(0x10)
+                    code.extend(encode_leb128(f_idx))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(out_addr))
                 elif left_max is not None and right_max is not None and expr.op in ['==', '!=']:
                     code.extend(self.compile_expr(expr.left))
                     code.append(0x21)
@@ -652,6 +998,9 @@ class WASMEmitter:
                     elif expr.op == '^': code.append(0x73)
             
         elif isinstance(expr, IndexExpr):
+            arr_t = self.resolver.infer_expr_type(expr.expr)
+            if isinstance(arr_t, StaticMapResolvedType):
+                return self._compile_static_map_lookup(arr_t, expr)
             # Calculate address = base_address + index * element_size
             arr_t = self.resolver.infer_expr_type(expr.expr)
             elem_size = arr_t.elem_type.get_size(self.resolver)
@@ -668,30 +1017,33 @@ class WASMEmitter:
             code.extend(b'\x02\x00') # alignment 2, offset 0
             
         elif isinstance(expr, FieldExpr):
-            # Calculate address = base_address + field_offset
-            struct_t = self.resolver.infer_expr_type(expr.expr)
-            if isinstance(struct_t, ListResolvedType) and expr.field == 'data':
-                code.extend(self.compile_expr(expr.expr))
-                # Load pointer from offset 0
+            field_t = self.resolver.infer_expr_type(expr)
+            if isinstance(field_t, StructResolvedType) and field_t.name == 'Rational':
+                code.extend(self._compile_field_address(expr))
+                return code
+            use_chained = isinstance(expr.expr, IndexExpr)
+            if isinstance(expr.expr, FieldExpr):
+                inner_t = self.resolver.infer_expr_type(expr.expr)
+                if isinstance(inner_t, StructResolvedType):
+                    use_chained = True
+            if use_chained:
+                code.extend(self._compile_field_address(expr))
                 code.append(0x28)
                 code.extend(b'\x02\x00')
             else:
-                field_offset = 0
-                target_ftype = None
-                for name, ftype in struct_t.fields:
-                    if name == expr.field:
-                        target_ftype = ftype
-                        break
-                    field_offset += ftype.get_size(self.resolver)
-                    
-                code.extend(self.compile_expr(expr.expr))
-                code.append(0x41) # const field_offset
-                code.extend(encode_sleb128(field_offset))
-                code.append(0x6a) # add
-                
-                # Load value from field address
-                code.append(0x28)
-                code.extend(b'\x02\x00')
+                struct_t = self.resolver.infer_expr_type(expr.expr)
+                if isinstance(struct_t, ListResolvedType) and expr.field == 'data':
+                    code.extend(self.compile_expr(expr.expr))
+                    code.append(0x28)
+                    code.extend(b'\x02\x00')
+                else:
+                    field_offset = self._field_offset(struct_t, expr.field)
+                    code.extend(self.compile_expr(expr.expr))
+                    code.append(0x41)
+                    code.extend(encode_sleb128(field_offset))
+                    code.append(0x6a)
+                    code.append(0x28)
+                    code.extend(b'\x02\x00')
             
         elif isinstance(expr, CallExpr):
             func_name = expr.func.name
@@ -719,6 +1071,85 @@ class WASMEmitter:
                 code.extend(encode_leb128(f_idx))
 
                 code.append(0x41)
+                code.extend(encode_sleb128(out_addr))
+            elif func_name == 'read_file':
+                site_id = self.resolver.read_file_call_exprs.get(id(expr))
+                if site_id is None:
+                    raise RuntimeError("read_file(...) call was not registered during type checking")
+                out_site = self.resolver.read_file_call_sites[site_id]
+                out_t = out_site['resolved_type']
+                out_addr = self.data_offset
+                self.data_offset += out_t.get_size(self.resolver)
+
+                code.extend(self.compile_expr(expr.args[0]))
+                code.append(0x21)
+                code.extend(encode_leb128(self._scratch_local))
+
+                code.append(0x41)
+                code.extend(encode_sleb128(site_id))
+                code.append(0x20)
+                code.extend(encode_leb128(self._scratch_local))
+                code.append(0x20)
+                code.extend(encode_leb128(self._scratch_local))
+                code.append(0x28)
+                code.extend(b'\x02\x00')
+                code.append(0x41)
+                code.extend(encode_sleb128(out_addr))
+                f_idx = self.func_indices['read_file_typed_raw']
+                code.append(0x10)
+                code.extend(encode_leb128(f_idx))
+
+                code.append(0x41)
+                code.extend(encode_sleb128(out_addr))
+            elif func_name == 'http_get':
+                site_id = self.resolver.http_get_call_exprs.get(id(expr))
+                if site_id is None:
+                    raise RuntimeError("http_get(...) call was not registered during type checking")
+                out_site = self.resolver.http_get_call_sites[site_id]
+                out_t = out_site['resolved_type']
+                out_addr = self.data_offset
+                self.data_offset += out_t.get_size(self.resolver)
+
+                code.extend(self.compile_expr(expr.args[0]))
+                code.append(0x21)
+                code.extend(encode_leb128(self._scratch_local))
+
+                code.append(0x41)
+                code.extend(encode_sleb128(site_id))
+                code.append(0x20)
+                code.extend(encode_leb128(self._scratch_local))
+                code.append(0x20)
+                code.extend(encode_leb128(self._scratch_local))
+                code.append(0x28)
+                code.extend(b'\x02\x00')
+                code.append(0x41)
+                code.extend(encode_sleb128(out_addr))
+                f_idx = self.func_indices['http_get_typed_raw']
+                code.append(0x10)
+                code.extend(encode_leb128(f_idx))
+
+                code.append(0x41)
+                code.extend(encode_sleb128(out_addr))
+            elif func_name in ('keys', 'values'):
+                map_type = self.resolver.infer_expr_type(expr.args[0])
+                handle = self._emit_map_handle(map_type, func_name == 'keys')
+                code.append(0x41)
+                code.extend(encode_sleb128(handle))
+            elif func_name == 'join':
+                out_addr = self.data_offset
+                self.data_offset += 8
+                result_t = self.resolver.infer_expr_type(expr)
+                max_out = self.resolver._struct_string_max_len(result_t) or 0
+                code.append(0x41)  # out_ptr
+                code.extend(encode_sleb128(out_addr))
+                code.extend(self.compile_expr(expr.args[0]))  # handle_ptr
+                code.extend(self.compile_expr(expr.args[1]))  # sep_ptr
+                code.append(0x41)  # max_out
+                code.extend(encode_sleb128(max_out))
+                f_idx = self.func_indices['join_strings_raw']
+                code.append(0x10)
+                code.extend(encode_leb128(f_idx))
+                code.append(0x41)  # return String pointer
                 code.extend(encode_sleb128(out_addr))
             elif func_name in self.resolver.type_decls or func_name in self.resolver.types:
                 # Constructor!
@@ -771,8 +1202,7 @@ class WASMEmitter:
                 code.extend(encode_sleb128(addr))
             else:
                 for arg in expr.args:
-                    arg_code = self.compile_expr(arg)
-                    code.extend(arg_code)
+                    code.extend(self.compile_expr(arg))
                 resolution = self.resolver.resolved_calls.get(id(expr))
                 if resolution:
                     call_symbol = ensure_mangled_name(resolution["decl"])
@@ -787,14 +1217,12 @@ class WASMEmitter:
             addr = self.data_offset
             data_bytes = bytearray()
             for el in expr.elements:
-                # Assuming list contains numeric literals or compile-time constants
-                if isinstance(el, Literal) and el.val_type == 'Integer':
-                    data_bytes.extend(el.value.to_bytes(4, byteorder='little', signed=True))
-                elif isinstance(el, Literal) and el.val_type == 'Char':
-                    val = ord(el.value) if isinstance(el.value, str) else int(el.value)
-                    data_bytes.extend(val.to_bytes(4, byteorder='little', signed=True))
-                else:
-                    data_bytes.extend(int(0).to_bytes(4, byteorder='little'))
+                data_bytes.extend(self._compile_time_serialize(el))
+            if self._list_pad_to is not None and self._list_elem_type is not None:
+                elem_size = self._list_elem_type.get_size(self.resolver)
+                pad_count = self._list_pad_to - len(expr.elements)
+                if pad_count > 0:
+                    data_bytes.extend(b'\x00' * (pad_count * elem_size))
                     
             # Register data segment
             self.data_section.append(
@@ -829,8 +1257,9 @@ class WASMEmitter:
         
         # 4. Memory Section (1 page = 64KB)
         binary.append(5)
-        # Limit flag: 0 (min page limit only), min: 1 page
-        mem_data = encode_vector([b'\x00' + encode_leb128(1)])
+        mem_bytes = self.data_offset + getattr(self.resolver, 'max_local_offset', 0) + 4096
+        min_pages = max(1, (mem_bytes + 65535) // 65536)
+        mem_data = encode_vector([b'\x00' + encode_leb128(min_pages)])
         binary.extend(encode_leb128(len(mem_data)))
         binary.extend(mem_data)
         

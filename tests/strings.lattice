@@ -23,9 +23,16 @@ function is_valid_email[MaxLen: Integer](s: String(MaxLen)) -> Bool {
 
 external function main() {
     let s1 = "hello ";
-    let raw: String(64) = input("Enter email: ");
-    if (is_valid_email(raw)) {
-        print(s1 + raw + "!");
+    let raw_opt: Input[String(64)] = input("Enter email: ");
+    match (raw_opt) {
+        Some(raw) => {
+            if (is_valid_email(raw)) {
+                print(s1 + raw + "!");
+            }
+            return 0;
+        }
+        None => {
+            return 0;
+        }
     }
-    return 0;
 }

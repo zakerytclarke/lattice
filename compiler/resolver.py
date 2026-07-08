@@ -2,7 +2,19 @@
 
 import sys
 from compiler.parser import *
-from compiler.input_types import validate_input_target_type, _input_hint
+from compiler.input_types import (
+    validate_input_target_type,
+    validate_read_file_target_type,
+    validate_http_get_target_type,
+    _input_hint,
+    _read_file_hint,
+    _http_get_hint,
+    read_file_string_max_len,
+    read_file_json_cap,
+    _is_list_resolved_type,
+    unwrap_input_inner,
+    _struct_string_max_len,
+)
 from compiler.string_literal import lower_string_literal
 from compiler.overloads import (
     BINOP_TO_FUNCTION,
@@ -115,6 +127,35 @@ class StringResolvedType(ResolvedType):
         # max_len chars + 4 bytes for current length field
         return (self.max_len * 4) + 4
 
+DEFAULT_STRING_CAPACITY = 64
+
+class StaticMapResolvedType(ResolvedType):
+    def __init__(self, value_type, entries):
+        self.name = "StaticMap"
+        self.value_type = value_type
+        self.entries = entries  # list of (key: str, value_addr: int)
+    def __repr__(self):
+        return f"StaticMap[{self.value_type}]"
+    def get_size(self, resolver):
+        return 0
+
+class MaterializedListResolvedType(ResolvedType):
+    """A compile-time-materialized list of values produced by keys(map)/values(map).
+
+    Represented at runtime as a handle: [count: i32][ptr_0: i32]...[ptr_{n-1}: i32]
+    where each pointer refers to a heap-style value (e.g. a String struct). This
+    is a lightweight intermediate type consumed by join(...); it is not a
+    general first-class List.
+    """
+    def __init__(self, elem_type, length):
+        self.name = "MaterializedList"
+        self.elem_type = elem_type
+        self.length = length
+    def __repr__(self):
+        return f"MaterializedList({self.length})[{self.elem_type}]"
+    def get_size(self, resolver):
+        return 4 + self.length * 4
+
 class IOResolvedType(ResolvedType):
     def __init__(self, inner):
         self.inner = inner
@@ -162,11 +203,23 @@ class Resolver:
         self._checking_call = None
         self.current_func_has_io = False
         self._input_expected_type = None
+        self._read_file_expected_type = None
+        self._http_get_expected_type = None
         self.input_call_sites = []
         self.input_call_exprs = {}
+        self.read_file_call_sites = []
+        self.read_file_call_exprs = {}
+        self.http_get_call_sites = []
+        self.http_get_call_exprs = {}
+        self.static_map_bindings = {}
+        self.memory_locals = {}
+        self.main_string_args = []
+        self.main_input_args = []
         self.diagnostics = None
         self.inferred_bindings = {}
         self.inferred_return_types = set()
+        self.function_instantiations = {}
+        self.pending_instantiation_resolve = []
         self._current_file_name = None
         self._current_source_lines = None
         
@@ -276,6 +329,16 @@ class Resolver:
         generic_map = generic_map or {}
         
         name = te.name
+        if name == 'String' and te.size is None and not te.args:
+            te = TypeExpr(
+                'String',
+                [],
+                te.line,
+                getattr(te, 'constraint', None),
+                getattr(te, 'constraint_var', None),
+                Literal(DEFAULT_STRING_CAPACITY, 'Integer', te.line),
+            )
+            name = 'String'
         # Substitute generic parameters if they are in the generic map
         if name in generic_map:
             val = generic_map[name]
@@ -573,7 +636,7 @@ class Resolver:
         found = False
 
         def expr_has_io(expr):
-            if self._is_input_call(expr):
+            if self._is_input_call(expr) or self._is_read_file_call(expr) or self._is_http_get_call(expr):
                 return True
             try:
                 t = self.infer_expr_type(expr)
@@ -625,6 +688,137 @@ class Resolver:
                 line,
                 hint="Only functions with IO effects (or an explicit -> IO[...] return type) may perform host interaction.",
             )
+
+    def _is_read_file_call(self, expr):
+        return (
+            isinstance(expr, CallExpr)
+            and isinstance(expr.func, Identifier)
+            and expr.func.name == "read_file"
+        )
+
+    def _infer_read_file_generics(self, expected_type, path_expr, line, generic_map=None):
+        inner = unwrap_input_inner(expected_type)
+        if inner is None:
+            raise LatticeTypeError(
+                f"read_file requires an Input[T] annotation, got {format_type(expected_type)}",
+                line,
+                hint=_read_file_hint(),
+            )
+        if _is_list_resolved_type(inner):
+            path_t = self.infer_expr_type(path_expr, generic_map)
+            path_len = self._struct_string_max_len(path_t)
+            if path_len is None and isinstance(path_expr, StringLiteral):
+                path_len = len(path_expr.value)
+            if path_len is None:
+                raise LatticeTypeError(
+                    "read_file path must have a fixed String capacity",
+                    line,
+                    hint="Annotate the path, e.g. let path: String(64) = \"data.json\";",
+                )
+            return None, path_len
+
+        max_len = _struct_string_max_len(inner)
+        if max_len is None:
+            raise LatticeTypeError(
+                f"read_file requires Input[String(N)] or Input[List(N)[T]], got Input[{format_type(inner)}]",
+                line,
+                hint=_read_file_hint(),
+            )
+        path_t = self.infer_expr_type(path_expr, generic_map)
+        path_len = self._struct_string_max_len(path_t)
+        if path_len is None and isinstance(path_expr, StringLiteral):
+            path_len = len(path_expr.value)
+        if path_len is None:
+            raise LatticeTypeError(
+                "read_file path must have a fixed String capacity",
+                line,
+                hint="Annotate the path, e.g. let path: String(64) = \"data.json\";",
+            )
+        return max_len, path_len
+
+    def _ensure_read_file_generics(self, expr, max_len, path_len):
+        if max_len is None:
+            return
+        if not expr.generic_args:
+            expr.generic_args = [
+                Literal(max_len, "Integer", expr.line),
+                Literal(path_len, "Integer", expr.line),
+            ]
+
+    def _check_read_file_call(self, expr, generic_map):
+        if id(expr) in self.read_file_call_exprs:
+            return
+        if expr.generic_args and len(expr.generic_args) >= 2:
+            return
+        raise LatticeTypeError(
+            "Cannot infer generic parameters for read_file(...)",
+            expr.line,
+            column=getattr(expr.func, "column", None),
+            span=len("read_file"),
+            hint=_read_file_hint(),
+        )
+
+    def _register_read_file_call(self, expr, resolved_type, type_expr=None):
+        key = id(expr)
+        if key in self.read_file_call_exprs:
+            return self.read_file_call_exprs[key]
+        validate_read_file_target_type(resolved_type, type_expr, expr.line)
+        inner = unwrap_input_inner(resolved_type)
+        site_id = len(self.read_file_call_sites)
+        column = getattr(expr.func, "column", 1)
+        site = {
+            "id": site_id,
+            "line": expr.line,
+            "column": column,
+            "resolved_type": resolved_type,
+            "type_expr": type_expr,
+        }
+        if inner is not None and _is_list_resolved_type(inner):
+            site["json_cap"] = read_file_json_cap(inner.length)
+        self.read_file_call_sites.append(site)
+        self.read_file_call_exprs[key] = site_id
+        return site_id
+
+    def _is_http_get_call(self, expr):
+        return (
+            isinstance(expr, CallExpr)
+            and isinstance(expr.func, Identifier)
+            and expr.func.name == "http_get"
+        )
+
+    def _check_http_get_call(self, expr, generic_map):
+        if id(expr) in self.http_get_call_exprs:
+            return
+        if expr.generic_args and len(expr.generic_args) >= 2:
+            return
+        raise LatticeTypeError(
+            "Cannot infer generic parameters for http_get(...)",
+            expr.line,
+            column=getattr(expr.func, "column", None),
+            span=len("http_get"),
+            hint=_http_get_hint(),
+        )
+
+    def _register_http_get_call(self, expr, resolved_type, type_expr=None):
+        key = id(expr)
+        if key in self.http_get_call_exprs:
+            return self.http_get_call_exprs[key]
+        validate_http_get_target_type(resolved_type, type_expr, expr.line)
+        inner = unwrap_input_inner(resolved_type)
+        site_id = len(self.http_get_call_sites)
+        column = getattr(expr.func, "column", 1)
+        site = {
+            "id": site_id,
+            "line": expr.line,
+            "column": column,
+            "resolved_type": resolved_type,
+            "type_expr": type_expr,
+        }
+        if inner is not None and _is_list_resolved_type(inner):
+            site["json_cap"] = read_file_json_cap(inner.length)
+        self.http_get_call_sites.append(site)
+        self.http_get_call_exprs[key] = site_id
+        return site_id
 
     def _is_input_call(self, expr):
         return (
@@ -728,6 +922,13 @@ class Resolver:
 
         if isinstance(expected, ListResolvedType) and isinstance(actual, ListResolvedType):
             if expected.length != actual.length:
+                if (
+                    expected.length is not None
+                    and actual.length is not None
+                    and actual.length < expected.length
+                ):
+                    self.types_compatible(expected.elem_type, actual.elem_type, line)
+                    return
                 raise LatticeTypeError(
                     f"List capacity mismatch: expected {expected.length} elements, got {actual.length}",
                     line,
@@ -737,6 +938,16 @@ class Resolver:
             return
 
         if isinstance(expected, StructResolvedType) and isinstance(actual, StructResolvedType):
+            expected_max = self._struct_string_max_len(expected)
+            actual_max = self._struct_string_max_len(actual)
+            if (
+                expected_max is not None
+                and actual_max is not None
+                and expected.name.startswith("String_")
+                and actual.name.startswith("String_")
+                and expected_max >= actual_max
+            ):
+                return
             if expected.name != actual.name:
                 raise LatticeTypeError(
                     type_mismatch_message(expected, actual, "Incompatible struct types"),
@@ -801,13 +1012,60 @@ class Resolver:
         finally:
             self._checking_call = prev_callee
 
+    def instantiate_generic_function(self, callee, call_generic_map, line):
+        if not callee.generics:
+            return callee
+        int_bindings = {}
+        for gname, gtype in callee.generics:
+            gtype_name = gtype.name if hasattr(gtype, 'name') else str(gtype)
+            if gtype_name != 'Integer':
+                continue
+            val = call_generic_map.get(gname)
+            if not isinstance(val, int):
+                return callee
+            int_bindings[gname] = val
+        if not int_bindings:
+            return callee
+
+        key = (callee.name, getattr(callee, 'overload_index', 0), tuple(sorted(int_bindings.items())))
+        if key in self.function_instantiations:
+            return self.function_instantiations[key]
+
+        clone = clone_ast_node(callee)
+        clone.monomorph_generics = dict(int_bindings)
+        suffix = "_".join(str(int_bindings[gname]) for gname, _ in callee.generics if gname in int_bindings)
+        clone.mangled_name = f"{callee.name}#{getattr(callee, 'overload_index', 0)}__{suffix}"
+
+        overloads = get_overloads(self.functions, callee.name)
+        if not isinstance(self.functions.get(callee.name), list):
+            self.functions[callee.name] = list(overloads)
+        self.functions[callee.name].append(clone)
+        self.function_instantiations[key] = clone
+        self.pending_instantiation_resolve.append(clone)
+        return clone
+
     def _check_call_types_impl(self, expr, generic_map, func_name):
         if func_name == "input":
             self._check_input_call(expr, generic_map)
             return
 
+        if func_name == "read_file":
+            self._check_read_file_call(expr, generic_map)
+            return
+        if func_name == "http_get":
+            self._check_http_get_call(expr, generic_map)
+            return
+
+        if func_name in ("keys", "values", "join"):
+            # Validates arg types (raises on mismatch) via the shared inference path.
+            self._infer_map_intrinsic(func_name, expr, generic_map)
+            return
+
         if get_overloads(self.functions, func_name):
             callee, call_generic_map = resolve_call(self, func_name, expr, generic_map)
+            callee = self.instantiate_generic_function(callee, call_generic_map, expr.line)
+            if id(expr) in self.resolved_calls:
+                self.resolved_calls[id(expr)]["decl"] = callee
             for idx, arg in enumerate(expr.args):
                 if isinstance(arg, StringLiteral):
                     expr.args[idx] = self._maybe_lower_string_arg(
@@ -1005,6 +1263,91 @@ class Resolver:
     def _is_bool_builtin_unop(self, op, operand_t):
         return op == '!' and operand_t.name == 'Bool'
 
+    def _is_rational_type(self, resolved_type):
+        return (
+            isinstance(resolved_type, StructResolvedType)
+            and resolved_type.name == 'Rational'
+        )
+
+    def _float_to_rational_expr(self, expr):
+        from fractions import Fraction
+
+        frac = Fraction(expr.value)
+        return CallExpr(
+            Identifier('Rational', expr.line),
+            [
+                Literal(int(frac.numerator), 'Integer', expr.line),
+                Literal(int(frac.denominator), 'Integer', expr.line),
+            ],
+            [],
+            expr.line,
+        )
+
+    def _lower_expr(self, expr):
+        if isinstance(expr, Literal) and expr.val_type == 'Float':
+            return self._float_to_rational_expr(expr)
+        if isinstance(expr, StructLiteral):
+            return StructLiteral(
+                [(fname, self._lower_expr(fexpr)) for fname, fexpr in expr.fields],
+                expr.line,
+            )
+        if isinstance(expr, MapLiteral):
+            return MapLiteral(
+                [(key, self._lower_expr(val)) for key, val in expr.entries],
+                expr.line,
+            )
+        if isinstance(expr, BinaryExpr):
+            return BinaryExpr(
+                expr.op,
+                self._lower_expr(expr.left),
+                self._lower_expr(expr.right),
+                expr.line,
+            )
+        if isinstance(expr, UnaryExpr):
+            return UnaryExpr(expr.op, self._lower_expr(expr.operand), expr.line)
+        if isinstance(expr, CallExpr):
+            return CallExpr(
+                expr.func,
+                [self._lower_expr(arg) for arg in expr.args],
+                expr.generic_args,
+                expr.line,
+            )
+        if isinstance(expr, FieldExpr):
+            return FieldExpr(self._lower_expr(expr.expr), expr.field, expr.line)
+        if isinstance(expr, IndexExpr):
+            return IndexExpr(
+                self._lower_expr(expr.expr),
+                self._lower_expr(expr.index),
+                expr.line,
+            )
+        if isinstance(expr, ListLiteral):
+            return ListLiteral(
+                [self._lower_expr(el) for el in expr.elements],
+                expr.line,
+            )
+        return expr
+
+    def _resolve_struct_literal_type(self, expr, generic_map):
+        if not expr.fields:
+            raise LatticeTypeError("Struct literal cannot be empty", expr.line)
+        resolved_fields = []
+        sig_parts = []
+        for fname, fexpr in expr.fields:
+            lowered = self._lower_expr(fexpr)
+            ftype = self.infer_expr_type(lowered, generic_map)
+            resolved_fields.append((fname, ftype))
+            sig_parts.append(f"{fname}_{ftype.name}")
+        mono_name = "__struct_" + "_".join(sig_parts)
+        if mono_name in self.types:
+            return self.types[mono_name]
+        struct_t = StructResolvedType(mono_name, resolved_fields, [])
+        self.register_type(mono_name, struct_t)
+        return struct_t
+
+    def _input_type_for(self, inner_type, line):
+        te = TypeExpr('Input', [self.resolved_to_type_expr(inner_type, line)], line)
+        return self.resolve_type_expr(te)
+
     def _resolve_operator_overload(self, func_name, left, right, line, generic_map):
         fake_call = CallExpr(
             Identifier(func_name, line),
@@ -1032,11 +1375,90 @@ class Resolver:
             return ret_t
         return self.types['void']
 
+    def _infer_map_intrinsic(self, func_name, expr, generic_map):
+        # keys(map) / values(map): materialize the compile-time dictionary into a
+        # list of its keys or values. join(list, sep): concatenate a list of
+        # strings with a separator.
+        if func_name in ("keys", "values"):
+            if len(expr.args) != 1:
+                raise LatticeTypeError(
+                    f"{func_name}(dictionary) takes exactly one argument",
+                    expr.line,
+                    hint=f"Use {func_name}(my_dict) where my_dict is a dictionary literal.",
+                )
+            map_t = self.infer_expr_type(expr.args[0], generic_map)
+            if not isinstance(map_t, StaticMapResolvedType):
+                raise LatticeTypeError(
+                    f"{func_name}(...) expects a dictionary, got {format_type(map_t)}",
+                    expr.line,
+                    hint='Build a dictionary with a map literal, e.g. let d = { "a": 1, "b": 2 };',
+                )
+            n = len(map_t.entries)
+            if func_name == "keys":
+                max_key = max((len(k) for k, _ in map_t.entries), default=0)
+                elem_t = self.resolve_type_expr(
+                    TypeExpr('String', [], expr.line, size=Literal(max_key, 'Integer', expr.line)),
+                    generic_map,
+                )
+            else:
+                elem_t = map_t.value_type
+            return MaterializedListResolvedType(elem_t, n)
+
+        # join(list, separator)
+        if len(expr.args) != 2:
+            raise LatticeTypeError(
+                "join(list, separator) takes exactly two arguments",
+                expr.line,
+                hint='Use join(keys(my_dict), ", ").',
+            )
+        list_t = self.infer_expr_type(expr.args[0], generic_map)
+        if not isinstance(list_t, MaterializedListResolvedType):
+            raise LatticeTypeError(
+                f"join(...) expects keys(...)/values(...) of a dictionary, got {format_type(list_t)}",
+                expr.line,
+                hint='Use join(keys(my_dict), ", ") or join(values(my_dict), ", ").',
+            )
+        elem_max = self._struct_string_max_len(list_t.elem_type)
+        if elem_max is None:
+            raise LatticeTypeError(
+                "join(...) can only join a list of strings",
+                expr.line,
+                hint="join(keys(map), sep) works because keys are strings; values must be strings too.",
+            )
+        sep_t = self.infer_expr_type(expr.args[1], generic_map)
+        sep_max = self._struct_string_max_len(sep_t)
+        if sep_max is None:
+            raise LatticeTypeError(
+                f"join separator must be a String, got {format_type(sep_t)}",
+                expr.line,
+            )
+        n = list_t.length
+        out_max = n * elem_max + max(0, n - 1) * sep_max
+        return self.resolve_type_expr(
+            TypeExpr('String', [], expr.line, size=Literal(out_max, 'Integer', expr.line)),
+            generic_map,
+        )
+
     def infer_expr_type(self, expr, generic_map=None):
         generic_map = generic_map or self.current_generic_map
         
         if isinstance(expr, Literal):
+            if expr.val_type == 'Float':
+                return self.types['Rational']
             return self.types[expr.val_type]
+
+        if isinstance(expr, StructLiteral):
+            return self._resolve_struct_literal_type(expr, generic_map)
+
+        if isinstance(expr, MapLiteral):
+            if not expr.entries:
+                raise LatticeTypeError("Map literal cannot be empty", expr.line)
+            first_val = self._lower_expr(expr.entries[0][1])
+            value_type = self.infer_expr_type(first_val, generic_map)
+            for _key, val in expr.entries[1:]:
+                val_t = self.infer_expr_type(self._lower_expr(val), generic_map)
+                self.types_compatible(value_type, val_t, expr.line)
+            return StaticMapResolvedType(value_type, [])
 
         if isinstance(expr, StringLiteral):
             return self.infer_expr_type(lower_string_literal(expr, len(expr.value)), generic_map)
@@ -1045,6 +1467,8 @@ class Resolver:
             # 1. Check local variable
             if expr.name in self.locals:
                 return self.locals[expr.name][0]
+            if expr.name in self.memory_locals:
+                return self.memory_locals[expr.name][0]
             # 2. Check global variable
             if expr.name in self.globals:
                 return self.globals[expr.name][0]
@@ -1110,6 +1534,26 @@ class Resolver:
 
             left_max = self._struct_string_max_len(left_t)
             right_max = self._struct_string_max_len(right_t)
+            if expr.op == '+' and left_max is not None and self._is_rational_type(right_t):
+                return self.resolve_type_expr(
+                    TypeExpr(
+                        'String',
+                        [],
+                        expr.line,
+                        size=Literal(left_max + 32, 'Integer', expr.line),
+                    ),
+                    generic_map,
+                )
+            if expr.op == '+' and left_max is not None and right_t.name == 'Integer':
+                return self.resolve_type_expr(
+                    TypeExpr(
+                        'String',
+                        [],
+                        expr.line,
+                        size=Literal(left_max + 16, 'Integer', expr.line),
+                    ),
+                    generic_map,
+                )
             if left_max is not None and right_max is not None:
                 if expr.op == '+':
                     out_max = left_max + right_max
@@ -1182,8 +1626,17 @@ class Resolver:
             arr_t = self.infer_expr_type(expr.expr, generic_map)
             if isinstance(arr_t, ListResolvedType):
                 return arr_t.elem_type
+            if isinstance(arr_t, StaticMapResolvedType):
+                index_t = self.infer_expr_type(expr.index, generic_map)
+                index_max = self._struct_string_max_len(index_t)
+                if index_max is None:
+                    raise LatticeTypeError(
+                        "Map lookup key must be a String(N)",
+                        expr.line,
+                    )
+                return self._input_type_for(arr_t.value_type, expr.line)
             raise LatticeTypeError(
-                f"Cannot index into {format_type(arr_t)} — only List types support []",
+                f"Cannot index into {format_type(arr_t)} — only List and map types support []",
                 expr.line,
             )
 
@@ -1219,7 +1672,32 @@ class Resolver:
                         hint=_input_hint(),
                     )
                 return IOResolvedType(self._input_expected_type)
-                
+
+            if func_name == "read_file":
+                if self._read_file_expected_type is None:
+                    raise LatticeTypeError(
+                        "Cannot infer the result type of read_file(...)",
+                        expr.line,
+                        column=getattr(expr.func, "column", None),
+                        span=len("read_file"),
+                        hint=_read_file_hint(),
+                    )
+                return IOResolvedType(self._read_file_expected_type)
+
+            if func_name == "http_get":
+                if self._http_get_expected_type is None:
+                    raise LatticeTypeError(
+                        "Cannot infer the result type of http_get(...)",
+                        expr.line,
+                        column=getattr(expr.func, "column", None),
+                        span=len("http_get"),
+                        hint=_http_get_hint(),
+                    )
+                return IOResolvedType(self._http_get_expected_type)
+
+            if func_name in ("keys", "values", "join"):
+                return self._infer_map_intrinsic(func_name, expr, generic_map)
+
             if not get_overloads(self.functions, func_name):
                 if func_name in self.types or func_name in self.type_decls:
                     if func_name in self.type_decls:
@@ -1340,6 +1818,12 @@ class Resolver:
                 except LatticeTypeError as e:
                     self._record_error(e)
 
+        for clone in self.pending_instantiation_resolve:
+            try:
+                self.resolve_func_body(clone)
+            except LatticeTypeError as e:
+                self._record_error(e)
+
     def check_calls_in_body(self, body):
         def visit_expr(expr):
             if isinstance(expr, CallExpr):
@@ -1409,10 +1893,13 @@ class Resolver:
         # Build local generic map for function's own generic parameters.
         # Size generics stay unresolved during body resolution and are inferred at call sites.
         local_generic_map = {}
+        bound = getattr(func, 'monomorph_generics', None) or {}
         if func.generics:
             for gname, gtype_expr in func.generics:
                 gtype_name = gtype_expr.name if hasattr(gtype_expr, 'name') else str(gtype_expr)
-                if gtype_name == 'Type':
+                if gname in bound:
+                    local_generic_map[gname] = bound[gname]
+                elif gtype_name == 'Type':
                     local_generic_map[gname] = self.types['Integer']
                 else:
                     local_generic_map[gname] = None
@@ -1426,12 +1913,46 @@ class Resolver:
         
         self.current_func_has_io = False
         
-        # Add parameters to locals (they are laid out at the bottom of stack frame)
+        # Add parameters to locals (they are laid out at the bottom of stack frame).
+        # main() receives untrusted external arguments: every parameter must be
+        # Input[T]. The runtime parses each CLI argument into T, producing Some on
+        # success or None on failure, and the program must match to unwrap. Each
+        # Input value is written into static memory before main runs.
+        if func.name == 'main':
+            # Body may be resolved more than once; rebuild the arg list each time.
+            self.main_input_args = []
         for param in func.params:
             ptype = self.resolve_type_expr(param.type_expr)
-            self.locals[param.name] = (ptype, self.local_offset)
+            if func.name == 'main':
+                inner = unwrap_input_inner(ptype)
+                if inner is None:
+                    self._record_error(LatticeTypeError(
+                        f"Parameter '{param.name}' of main must be Input[T], got {format_type(ptype)}",
+                        func.line,
+                        hint=(
+                            "Command-line arguments are untrusted external input. Declare "
+                            "the parameter as Input[T] and match on Some/None, e.g. "
+                            "main(x: Input[Integer]) { match (x) { Some(v) => {...} None => {...} } }"
+                        ),
+                    ))
+                    self.locals[param.name] = (ptype, self.local_offset)
+                    self.local_offset += ptype.get_size(self)
+                    self.immutable_locals.add(param.name)
+                    continue
+                offset = self.global_offset
+                self.global_offset += ptype.get_size(self)
+                self.memory_locals[param.name] = (ptype, offset)
+                self.main_input_args.append(
+                    {
+                        'name': param.name,
+                        'addr': offset,
+                        'inner_type': inner,
+                    }
+                )
+            else:
+                self.locals[param.name] = (ptype, self.local_offset)
+                self.local_offset += ptype.get_size(self)
             self.immutable_locals.add(param.name)
-            self.local_offset += ptype.get_size(self)
 
         if func.ret_type:
             declared_ret = self.resolve_type_expr(func.ret_type)
@@ -1526,6 +2047,28 @@ class Resolver:
 
     def _resolve_statement(self, stmt):
         if isinstance(stmt, VarDecl):
+            stmt.value = self._lower_expr(stmt.value)
+
+            if isinstance(stmt.value, MapLiteral):
+                if not stmt.value.entries:
+                    raise LatticeTypeError("Map literal cannot be empty", stmt.line)
+                value_type = self.infer_expr_type(
+                    self._lower_expr(stmt.value.entries[0][1])
+                )
+                entries = []
+                for key, val in stmt.value.entries:
+                    lowered = self._lower_expr(val)
+                    val_t = self.infer_expr_type(lowered)
+                    self.types_compatible(value_type, val_t, stmt.line)
+                    entries.append((key, lowered))
+                map_type = StaticMapResolvedType(value_type, entries)
+                self.static_map_bindings[stmt.name] = map_type
+                self.locals[stmt.name] = (map_type, 0)
+                self.immutable_locals.add(stmt.name)
+                if stmt.is_const:
+                    self.const_locals.add(stmt.name)
+                return
+
             if isinstance(stmt.value, StringLiteral):
                 cap = self._string_capacity_from_type_expr(stmt.type_expr)
                 if cap is None:
@@ -1539,16 +2082,48 @@ class Resolver:
                     hint=_input_hint(),
                 )
 
+            if self._is_read_file_call(stmt.value) and not stmt.type_expr:
+                raise LatticeTypeError(
+                    "Cannot infer generic parameters for read_file(...)",
+                    stmt.line,
+                    hint=_read_file_hint(),
+                )
+
+            if self._is_http_get_call(stmt.value) and not stmt.type_expr:
+                raise LatticeTypeError(
+                    "Cannot infer generic parameters for http_get(...)",
+                    stmt.line,
+                    hint=_http_get_hint(),
+                )
+
             prev_expected = self._input_expected_type
+            prev_read_file_expected = self._read_file_expected_type
+            prev_http_get_expected = self._http_get_expected_type
             if self._is_input_call(stmt.value):
                 expected = self.resolve_type_expr(stmt.type_expr)
                 self._input_expected_type = expected
                 self._register_input_call(stmt.value, expected, stmt.type_expr)
 
+            if self._is_read_file_call(stmt.value):
+                expected = self.resolve_type_expr(stmt.type_expr)
+                self._read_file_expected_type = expected
+                self._register_read_file_call(stmt.value, expected, stmt.type_expr)
+                max_len, path_len = self._infer_read_file_generics(
+                    expected, stmt.value.args[0], stmt.line
+                )
+                self._ensure_read_file_generics(stmt.value, max_len, path_len)
+
+            if self._is_http_get_call(stmt.value):
+                expected = self.resolve_type_expr(stmt.type_expr)
+                self._http_get_expected_type = expected
+                self._register_http_get_call(stmt.value, expected, stmt.type_expr)
+
             try:
                 raw_value_t = self.infer_expr_type(stmt.value)
             finally:
                 self._input_expected_type = prev_expected
+                self._read_file_expected_type = prev_read_file_expected
+                self._http_get_expected_type = prev_http_get_expected
 
             if isinstance(raw_value_t, IOResolvedType):
                 self._require_io_allowed(stmt.line, "IO binding")

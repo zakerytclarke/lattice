@@ -182,13 +182,23 @@ class ListLiteral(ASTNode):
         super().__init__(line)
         self.elements = elements
 
+class StructLiteral(ASTNode):
+    def __init__(self, fields, line):
+        super().__init__(line)
+        self.fields = fields  # list of (name, expr)
+
+class MapLiteral(ASTNode):
+    def __init__(self, entries, line):
+        super().__init__(line)
+        self.entries = entries  # list of (key, expr)
+
 # ============================================================================
 # 2. Tokenizer / Lexer
 # ============================================================================
 
 TOKEN_SPEC = [
-    ('COMMENT',   r'//.*'),
-    ('NUMBER',    r'\d+'),
+    ('COMMENT',   r'//.*|#.*'),
+    ('NUMBER',    r'\d+\.\d+|\d+'),
     ('STRING',    r'"[^"]*"|\'[^\']{2,}\'|\'\''),
     ('CHAR',      r"'[^']'"),
     ('ARROW',     r'->'),
@@ -725,6 +735,14 @@ class Parser:
         return expr
 
     def parse_unary(self):
+        if self.peek() and self.peek().type == 'OP' and self.peek().value == '-':
+            self.consume('OP')
+            operand = self.parse_unary()
+            if isinstance(operand, Literal) and operand.val_type == 'Integer':
+                return Literal(-operand.value, 'Integer', operand.line)
+            if isinstance(operand, Literal) and operand.val_type == 'Float':
+                return Literal('-' + operand.value, 'Float', operand.line)
+            raise LatticeSyntaxError("unary minus only supports numeric literals", operand.line)
         if self.peek() and self.peek().type == 'OP' and self.peek().value == '!':
             self.consume('OP')
             operand = self.parse_unary()
@@ -806,7 +824,10 @@ class Parser:
             raise LatticeSyntaxError("unexpected end of file while parsing expression", line, column)
             
         if self.match('NUMBER'):
-            return Literal(int(self.tokens[self.pos-1].value), 'Integer', t.line)
+            raw = self.tokens[self.pos - 1].value
+            if '.' in raw:
+                return Literal(raw, 'Float', t.line)
+            return Literal(int(raw), 'Integer', t.line)
         if self.match('STRING'):
             return StringLiteral(self.tokens[self.pos-1].value, t.line)
         if self.match('CHAR'):
@@ -836,6 +857,38 @@ class Parser:
                         break
             self.consume('RBRACKET')
             return ListLiteral(elements, t.line)
+
+        # Map { "key": value, ... } or struct { field: value, ... }
+        if self.match('LBRACE'):
+            if self.peek() and self.peek().type == 'STRING':
+                entries = []
+                if not self.peek() or self.peek().type != 'RBRACE':
+                    while True:
+                        key = self.consume('STRING').value
+                        self.consume('COLON')
+                        val = self.parse_expr()
+                        entries.append((key, val))
+                        if not self.match('COMMA'):
+                            break
+                self.consume('RBRACE')
+                return MapLiteral(entries, t.line)
+            if self.peek() and self.peek().type == 'ID':
+                fields = []
+                if not self.peek() or self.peek().type != 'RBRACE':
+                    while True:
+                        fname = self.consume('ID').value
+                        self.consume('COLON')
+                        val = self.parse_expr()
+                        fields.append((fname, val))
+                        if not self.match('COMMA'):
+                            break
+                self.consume('RBRACE')
+                return StructLiteral(fields, t.line)
+            raise LatticeSyntaxError(
+                "expected string key or field name inside { ... }",
+                t.line,
+                t.column if hasattr(t, 'column') else 1,
+            )
             
         raise LatticeSyntaxError(
             f"unexpected token '{t.value}' ({t.type})",

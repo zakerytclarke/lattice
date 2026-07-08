@@ -14,6 +14,10 @@
       {
         "args": [10],
         "expected": 3628800
+      },
+      {
+        "args": [0],
+        "expected": 0
       }
     ]
   },
@@ -207,5 +211,39 @@
   {
     "file": "input_untyped_unsafe.lattice",
     "should_fail": true
+  },
+  {
+    "file": "read_file_untyped_unsafe.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "users_table.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": 159
+      }
+    ]
+  },
+  {
+    "file": "users_table_overflow.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": 0
+      }
+    ]
+  },
+  {
+    "file": "weather_http_safe.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": ["New York"],
+        "expected_range": [-40, 50]
+      }
+    ]
   }
 ]

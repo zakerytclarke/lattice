@@ -1,0 +1,94 @@
+{
+  "main": {
+    "params": [
+      {
+        "name": "city_arg",
+        "type": "Input[String]",
+        "base": "Input"
+      }
+    ],
+    "input_args": [
+      {
+        "name": "city_arg",
+        "addr": 1285,
+        "type": "String(64)",
+        "base": "String",
+        "max_len": 64
+      }
+    ]
+  },
+  "input_calls": [],
+  "read_file_calls": [],
+  "http_get_calls": [
+    {
+      "id": 0,
+      "line": 16,
+      "column": 44,
+      "type": "Input[WeatherResponse]",
+      "base": "Input",
+      "inner": {
+        "type": "WeatherResponse",
+        "base": "WeatherResponse",
+        "fields": [
+          {
+            "name": "utc_offset_seconds",
+            "type": "Integer",
+            "base": "Integer"
+          },
+          {
+            "name": "current",
+            "type": "CurrentWeather",
+            "base": "CurrentWeather",
+            "fields": [
+              {
+                "name": "interval",
+                "type": "Integer",
+                "base": "Integer"
+              },
+              {
+                "name": "temperature_2m",
+                "type": "Integer",
+                "base": "Integer"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 1,
+      "line": 16,
+      "column": 44,
+      "type": "Input[WeatherResponse]",
+      "base": "Input",
+      "inner": {
+        "type": "WeatherResponse",
+        "base": "WeatherResponse",
+        "fields": [
+          {
+            "name": "utc_offset_seconds",
+            "type": "Integer",
+            "base": "Integer"
+          },
+          {
+            "name": "current",
+            "type": "CurrentWeather",
+            "base": "CurrentWeather",
+            "fields": [
+              {
+                "name": "interval",
+                "type": "Integer",
+                "base": "Integer"
+              },
+              {
+                "name": "temperature_2m",
+                "type": "Integer",
+                "base": "Integer"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

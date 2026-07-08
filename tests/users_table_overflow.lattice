@@ -1,0 +1,24 @@
+// Overflow case: too many JSON records → read_file returns None (not a runtime error).
+
+type StrSlice(start: Integer, len: Integer)
+
+type User(
+    name: StrSlice,
+    email: StrSlice,
+    phone: StrSlice,
+    age: Integer,
+    birthdate: StrSlice
+)
+
+external function main() {
+    let path: String(40) = "tests/sample_users_overflow.json";
+    let users_opt: Input[List(100)[User]] = read_file(path);
+    match (users_opt) {
+        Some(users) => {
+            return users.data[0].age;
+        }
+        None => {
+            return 0;
+        }
+    }
+}

@@ -4,7 +4,12 @@ function get_value_unsafe(opt: Input[Integer]) -> Integer {
     }
 }
 
-external function main(val) {
-    let opt_some: Input[Integer] = Some(val);
-    return get_value_unsafe(opt_some);
+external function main(val_arg: Input[Integer]) {
+    match (val_arg) {
+        Some(val) => {
+            let opt_some: Input[Integer] = Some(val);
+            return get_value_unsafe(opt_some);
+        }
+        None => { return 0; }
+    }
 }

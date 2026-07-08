@@ -288,8 +288,8 @@ def format_type(resolved_type):
 def static_memory_hint():
     return (
         "Lattice has no heap or growable stack — every value needs a fixed size at compile time. "
-        "Specify capacities in types (e.g. List(5)[Integer], String(64)) or pass explicit generics "
-        "(e.g. read_file[1024, 256](path))."
+        "Specify capacities in types (e.g. List(5)[Integer], String(64), let x: Input[String(1024)] = read_file(path)), "
+        "or pass explicit generics (e.g. read_file[1024, 256](path))."
     )
 
 

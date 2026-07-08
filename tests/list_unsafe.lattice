@@ -15,10 +15,15 @@ function set[T: Type, N: Integer](let list: List(N)[T], idx: Integer, val: T) ->
     return list;
 }
 
-external function main(val) {
-    let my_list: List(5)[Integer] = List([0, 0, 0, 0, 0]);
-    let current_len = 5;
-    
-    // Unsafe: setting at index 5 on a list of capacity 5
-    return get(set(my_list, current_len, val), 0);
+external function main(val_arg: Input[Integer]) {
+    match (val_arg) {
+        Some(val) => {
+            let my_list: List(5)[Integer] = List([0, 0, 0, 0, 0]);
+            let current_len = 5;
+
+            // Unsafe: setting at index 5 on a list of capacity 5
+            return get(set(my_list, current_len, val), 0);
+        }
+        None => { return 0; }
+    }
 }

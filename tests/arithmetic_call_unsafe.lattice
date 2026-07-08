@@ -2,6 +2,14 @@ function add_unsafe(a: Integer(x){x >= 0 && x <= 50}, b: Integer(y){y >= 0 && y 
     return a + b;
 }
 
-external function main(a, b) {
-    return add_unsafe(a, b);
+external function main(a_arg: Input[Integer], b_arg: Input[Integer]) {
+    match (a_arg) {
+        Some(a) => {
+            match (b_arg) {
+                Some(b) => { return add_unsafe(a, b); }
+                None => { return 0; }
+            }
+        }
+        None => { return 0; }
+    }
 }

@@ -10,13 +10,28 @@ function mixed_math(a: Integer, b: Rational) -> Rational {
     return add(Rational(a, 1), b);
 }
 
-external function main(a, num, den) {
-    if (a < 0 || a > 50 || num < 0 || num > 50 || den <= 0 || den > 50) {
-        return 0;
-    } else {
-        const sum = add_safe(a, num);
-        const rat = Rational(num, den);
-        const mixed = mixed_math(a, rat);
-        return sum;
+external function main(a_arg: Input[Integer], num_arg: Input[Integer], den_arg: Input[Integer]) {
+    match (a_arg) {
+        Some(a) => {
+            match (num_arg) {
+                Some(num) => {
+                    match (den_arg) {
+                        Some(den) => {
+                            if (a < 0 || a > 50 || num < 0 || num > 50 || den <= 0 || den > 50) {
+                                return 0;
+                            } else {
+                                const sum = add_safe(a, num);
+                                const rat = Rational(num, den);
+                                const mixed = mixed_math(a, rat);
+                                return sum;
+                            }
+                        }
+                        None => { return 0; }
+                    }
+                }
+                None => { return 0; }
+            }
+        }
+        None => { return 0; }
     }
 }

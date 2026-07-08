@@ -3,7 +3,7 @@
 # Lattice Compiler & Execution CLI Launcher
 
 if [ -z "$1" ]; then
-    echo "Usage: lattice [--optimal] <source_file.lattice> [args...]"
+    echo "Usage: lattice [--inspect] <source_file.lattice> [args...]"
     exit 1
 fi
 
@@ -13,8 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPILER_FLAGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --optimal)
-            COMPILER_FLAGS+=(--optimal)
+        --inspect|--optimal)
+            COMPILER_FLAGS+=(--inspect)
             shift
             ;;
         --)
@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -*)
             echo "Unknown flag: $1"
-            echo "Usage: lattice [--optimal] <source_file.lattice> [args...]"
+            echo "Usage: lattice [--inspect] <source_file.lattice> [args...]"
             exit 1
             ;;
         *)
@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$1" ]; then
-    echo "Usage: lattice [--optimal] <source_file.lattice> [args...]"
+    echo "Usage: lattice [--inspect] <source_file.lattice> [args...]"
     exit 1
 fi
 

@@ -8,6 +8,9 @@ function factorial_incorrect_termination(n: Integer(x){x > 0}) -> Integer {
 
 
 
-external function main(n) {
-    return factorial_incorrect_termination(n);
+external function main(n_arg: Input[Integer(x){x > 0}]) {
+    match (n_arg) {
+        Some(n) => { return factorial_incorrect_termination(n); }
+        None => { return 0; }
+    }
 }

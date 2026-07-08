@@ -6,6 +6,9 @@ function factorial(n: Integer(x){x > 0}) -> Integer {
     }
 }
 
-external function main(n) {
-    return factorial(n);
+external function main(n_arg: Input[Integer(x){x > 0}]) {
+    match (n_arg) {
+        Some(n) => { return factorial(n); }
+        None => { return 0; }
+    }
 }

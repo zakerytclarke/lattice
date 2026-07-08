@@ -142,18 +142,63 @@ external function print_raw_string(addr: Integer, len: Integer) -> IO[void] {}
 external function read_int_raw(out_ptr: Integer) -> IO[void] {}
 external function read_string_raw(out_ptr: Integer, max_len: Integer) -> IO[void] {}
 external function read_file_raw(path_ptr: Integer, path_len: Integer, out_ptr: Integer, max_len: Integer) -> IO[void] {}
+external function read_file_typed_raw(call_id: Integer, path_ptr: Integer, path_len: Integer, out_ptr: Integer) -> IO[void] {}
+external function http_get_typed_raw(call_id: Integer, url_ptr: Integer, url_len: Integer, out_ptr: Integer) -> IO[void] {}
 external function http_get_raw(url_ptr: Integer, url_len: Integer, out_ptr: Integer, max_len: Integer) -> IO[void] {}
 external function input_typed(call_id: Integer, prompt_ptr: Integer, out_ptr: Integer) -> IO[void] {}
 external function concat_strings(out_ptr: Integer, a_ptr: Integer, b_ptr: Integer, max_out: Integer) -> void {}
 external function strings_equal(a_ptr: Integer, b_ptr: Integer) -> Integer {}
+external function rational_to_string_raw(r_ptr: Integer, out_ptr: Integer, max_len: Integer) -> void {}
+external function integer_to_string_raw(val: Integer, out_ptr: Integer, max_len: Integer) -> void {}
+external function join_strings_raw(out_ptr: Integer, handle_ptr: Integer, sep_ptr: Integer, max_out: Integer) -> void {}
 
 // High-level safe wrapper functions
 function print[MaxLen: Integer](s: String(MaxLen)) -> IO[void] {
     print_string(s);
 }
 
+function println[MaxLen: Integer](s: String(MaxLen)) -> IO[void] {
+    print(s);
+    print_char('\n');
+}
+
 function print_string[MaxLen: Integer](s: String(MaxLen)) -> IO[void] {
     print_raw_string(s.data.data, s.len);
+}
+
+// Naive string conversions for primitive types
+function integer_to_string(val: Integer) -> String(16) {
+    let result: String(16) = "";
+    integer_to_string_raw(val, result, 16);
+    return result;
+}
+
+function rational_to_string(r: Rational) -> String(32) {
+    let result: String(32) = "";
+    rational_to_string_raw(r, result, 32);
+    return result;
+}
+
+// Naive print overloads for primitive types. Users can override any of these
+// (or the auto-generated struct prints) by declaring their own print(x: Type).
+function print(val: Integer) -> IO[void] {
+    print_string(integer_to_string(val));
+}
+
+function print(r: Rational) -> IO[void] {
+    print_string(rational_to_string(r));
+}
+
+function print(b: Bool) -> IO[void] {
+    if (b) {
+        print_string("true");
+    } else {
+        print_string("false");
+    }
+}
+
+function print(c: Char) -> IO[void] {
+    print_char(c);
 }
 
 function read_int() -> IO[Input[Integer]] {

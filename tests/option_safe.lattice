@@ -5,9 +5,13 @@ function get_value_or_default(opt: Input[Integer], default_val: Integer) -> Inte
     }
 }
 
-external function main(val) {
-    let opt_some: Input[Integer] = Some(val);
-    let opt_none: Input[Integer] = None();
-    
-    return get_value_or_default(opt_some, 100) + get_value_or_default(opt_none, 100);
+external function main(val_arg: Input[Integer]) {
+    match (val_arg) {
+        Some(val) => {
+            let opt_some: Input[Integer] = Some(val);
+            let opt_none: Input[Integer] = None();
+            return get_value_or_default(opt_some, 100) + get_value_or_default(opt_none, 100);
+        }
+        None => { return 0; }
+    }
 }

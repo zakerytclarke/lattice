@@ -1,0 +1,7 @@
+external function main() {
+    let cities = {
+        "London": { latitude: 51.5, longitude: -0.25 }
+    };
+    print(join(values(cities), ", "));
+    return 0;
+}

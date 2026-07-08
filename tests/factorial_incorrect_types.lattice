@@ -8,6 +8,9 @@ function factorial_incorrect_types(n: Integer) -> Integer {
 
 
 
-external function main(n) {
-    return factorial_incorrect_types(n);
+external function main(n_arg: Input[Integer]) {
+    match (n_arg) {
+        Some(n) => { return factorial_incorrect_types(n); }
+        None => { return 0; }
+    }
 }

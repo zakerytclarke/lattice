@@ -1,7 +1,7 @@
 # Compile-time function overload registry and resolution
 
 from compiler.errors import format_type_expr, format_type, LatticeTypeError, type_mismatch_hint
-from compiler.parser import FuncDecl, Param, TypeExpr
+from compiler.parser import FuncDecl, Param, TypeExpr, Literal
 
 # Operator symbols desugar to named functions when a matching overload exists.
 # Integer/Char/Bool keep selected WASM builtins (see resolver) so stdlib bodies
@@ -100,7 +100,11 @@ def _build_call_generic_map(resolver, callee, expr, generic_map):
         if expr.generic_args:
             for i, (gname, _) in enumerate(callee.generics):
                 if i < len(expr.generic_args):
-                    call_generic_map[gname] = expr.generic_args[i]
+                    garg = expr.generic_args[i]
+                    if isinstance(garg, Literal) and garg.val_type == "Integer":
+                        call_generic_map[gname] = garg.value
+                    else:
+                        call_generic_map[gname] = garg
         else:
             for idx, arg in enumerate(expr.args):
                 if idx < len(callee.params):

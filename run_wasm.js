@@ -72,6 +72,37 @@ function readStringStruct(view, stringPtr) {
     return s;
 }
 
+const USER_RECORD_SIZE = 36;
+
+function jsonFieldSlice(jsonText, key, value) {
+    const val = String(value);
+    const patterns = [`"${key}":"${val}"`, `"${key}": "${val}"`];
+    for (const pattern of patterns) {
+        const idx = jsonText.indexOf(pattern);
+        if (idx >= 0) {
+            const start = idx + pattern.indexOf(val);
+            return { start, len: val.length };
+        }
+    }
+    return { start: 0, len: 0 };
+}
+
+function writeUserRecord(view, base, jsonText, record) {
+    const name = jsonFieldSlice(jsonText, 'name', record.name || '');
+    const email = jsonFieldSlice(jsonText, 'email', record.email || '');
+    const phone = jsonFieldSlice(jsonText, 'phone', record.phone || '');
+    const birthdate = jsonFieldSlice(jsonText, 'birthdate', record.birthdate || '');
+    view.setInt32(base + 0, name.start, true);
+    view.setInt32(base + 4, name.len, true);
+    view.setInt32(base + 8, email.start, true);
+    view.setInt32(base + 12, email.len, true);
+    view.setInt32(base + 16, phone.start, true);
+    view.setInt32(base + 20, phone.len, true);
+    view.setInt32(base + 24, (record.age | 0), true);
+    view.setInt32(base + 28, birthdate.start, true);
+    view.setInt32(base + 32, birthdate.len, true);
+}
+
 let stdinRemainder = "";
 
 function readStdinLine(fs) {
@@ -202,16 +233,289 @@ function writeInputValue(view, allocate, outPtr, parsed) {
     }
 }
 
+function schemaTypeSize(schema) {
+    switch (schema.base) {
+        case 'Integer':
+        case 'Bool':
+            return 4;
+        case 'Rational':
+            return 8;
+        case 'String':
+            return 8 + schema.max_len * 4;
+        case 'List':
+            return schema.length * schemaTypeSize(schema.elem);
+        default:
+            break;
+    }
+    if (schema.fields) {
+        let size = 0;
+        for (const field of schema.fields) {
+            size += schemaTypeSize(field);
+        }
+        return size;
+    }
+    if (schema.base === 'Rational') {
+        return 8;
+    }
+    if (schema.base === 'String') {
+        return (schema.max_len || 64) * 4 + 4;
+    }
+    if (schema.base === 'StrSlice') {
+        return 8;
+    }
+    return 4;
+}
+
+function writeStructFieldFromJson(view, base, offset, fieldSchema, jsonText, record, fieldName) {
+    switch (fieldSchema.base) {
+        case 'Integer':
+            view.setInt32(base + offset, (record[fieldName] | 0) || 0, true);
+            return 4;
+        case 'Bool':
+            view.setInt32(base + offset, record[fieldName] ? 1 : 0, true);
+            return 4;
+        case 'Rational': {
+            const value = Number(record[fieldName]);
+            const scaled = Math.round(value * 100);
+            view.setInt32(base + offset, scaled, true);
+            view.setInt32(base + offset + 4, 100, true);
+            return 8;
+        }
+        case 'String': {
+            const maxLen = fieldSchema.max_len || 64;
+            const text = String(record[fieldName] ?? '');
+            const finalLen = Math.min(text.length, maxLen);
+            view.setInt32(base + offset, finalLen, true);
+            const listPtr = allocate(4);
+            view.setInt32(base + offset + 4, listPtr, true);
+            const charDataPtr = allocate(maxLen * 4);
+            view.setInt32(listPtr, charDataPtr, true);
+            for (let i = 0; i < finalLen; i++) {
+                view.setInt32(charDataPtr + i * 4, text.codePointAt(i), true);
+            }
+            return maxLen * 4 + 4;
+        }
+        case 'StrSlice': {
+            const slice = jsonFieldSlice(jsonText, fieldName, record[fieldName] || '');
+            view.setInt32(base + offset, slice.start, true);
+            view.setInt32(base + offset + 4, slice.len, true);
+            return 8;
+        }
+        default:
+            if (fieldSchema.fields) {
+                const subRecord = record && record[fieldName];
+                if (!subRecord || typeof subRecord !== 'object') {
+                    return schemaTypeSize(fieldSchema);
+                }
+                let subOffset = 0;
+                for (const subField of fieldSchema.fields) {
+                    subOffset += writeStructFieldFromJson(
+                        view,
+                        base + offset,
+                        subOffset,
+                        subField,
+                        jsonText,
+                        subRecord,
+                        subField.name
+                    );
+                }
+                return subOffset;
+            }
+            throw new Error(`unsupported read_file struct field type ${fieldSchema.base}`);
+    }
+}
+
+function resolveJsonRecord(data, innerSchema) {
+    if (innerSchema.fields && data && typeof data === 'object' && !Array.isArray(data)) {
+        const hasCurrentField = innerSchema.fields.some((field) => field.name === 'current');
+        if (
+            !hasCurrentField
+            && data.current
+            && typeof data.current === 'object'
+            && !Array.isArray(data.current)
+        ) {
+            return data.current;
+        }
+    }
+    return data;
+}
+
+function writeTypedJsonInput(view, allocate, inner, content, outPtr) {
+    const mem = new Uint8Array(view.buffer);
+    if (inner.base === 'String') {
+        const maxLen = inner.max_len;
+        if (content.length > maxLen) {
+            mem[outPtr] = 1;
+            return;
+        }
+        writeReadFileInputString(view, allocate, { inner }, content, outPtr);
+        return;
+    }
+    if (inner.base === 'List') {
+        let records;
+        try {
+            records = JSON.parse(content);
+        } catch (e) {
+            mem[outPtr] = 1;
+            return;
+        }
+        if (!Array.isArray(records) || records.length > inner.length) {
+            mem[outPtr] = 1;
+            return;
+        }
+        writeReadFileInputList(view, allocate, inner, content, records, outPtr);
+        return;
+    }
+    if (inner.fields) {
+        let data;
+        try {
+            data = JSON.parse(content);
+        } catch (e) {
+            mem[outPtr] = 1;
+            return;
+        }
+        const record = resolveJsonRecord(data, inner);
+        if (!record || typeof record !== 'object' || Array.isArray(record)) {
+            mem[outPtr] = 1;
+            return;
+        }
+        mem[outPtr] = 0;
+        writeStructFromJsonRecord(view, outPtr + 1, inner, content, record);
+        return;
+    }
+    mem[outPtr] = 1;
+}
+
+function writeStructFromJsonRecord(view, base, schema, jsonText, record) {
+    let offset = 0;
+    for (const field of schema.fields || []) {
+        offset += writeStructFieldFromJson(
+            view,
+            base,
+            offset,
+            field,
+            jsonText,
+            record,
+            field.name
+        );
+    }
+}
+
+function writeInputSome(view, allocate, outPtr, innerSchema, parsed) {
+    const mem = new Uint8Array(view.buffer);
+    mem[outPtr] = 0;
+    switch (parsed.kind) {
+        case 'Integer':
+        case 'Bool':
+            view.setInt32(outPtr + 1, parsed.value, true);
+            return;
+        case 'Rational': {
+            const payloadPtr = allocate(8);
+            view.setInt32(outPtr + 1, payloadPtr, true);
+            view.setInt32(payloadPtr, parsed.num, true);
+            view.setInt32(payloadPtr + 4, parsed.den, true);
+            return;
+        }
+        case 'String': {
+            const stringPtr = allocate(8);
+            view.setInt32(outPtr + 1, stringPtr, true);
+            writeStringValue(view, allocate, stringPtr, parsed.value, parsed.maxLen);
+            return;
+        }
+        case 'List': {
+            const elemSize = schemaTypeSize(innerSchema.elem);
+            const listDataPtr = allocate(innerSchema.length * elemSize);
+            for (let i = 0; i < parsed.length; i++) {
+                writeInputValue(view, allocate, listDataPtr + i * elemSize, parsed.elems[i]);
+            }
+            const listWrapperPtr = allocate(4);
+            view.setInt32(listWrapperPtr, listDataPtr, true);
+            view.setInt32(outPtr + 1, listWrapperPtr, true);
+            return;
+        }
+        default:
+            throw new Error(`unsupported parsed input kind ${parsed.kind}`);
+    }
+}
+
+function writeReadFileInputList(view, allocate, innerSchema, content, records, outPtr) {
+    const mem = new Uint8Array(view.buffer);
+    const elemSize = schemaTypeSize(innerSchema.elem);
+    const listDataPtr = allocate(innerSchema.length * elemSize);
+    writeReadFileList(view, allocate, innerSchema, content, records, listDataPtr);
+    const listWrapperPtr = allocate(4);
+    view.setInt32(listWrapperPtr, listDataPtr, true);
+    mem[outPtr] = 0;
+    view.setInt32(outPtr + 1, listWrapperPtr, true);
+}
+
+function writeReadFileList(view, allocate, schema, jsonText, records, listDataPtr) {
+    const elemSchema = schema.elem;
+    const elemSize = schemaTypeSize(elemSchema);
+    const count = Math.min(records.length, schema.length);
+    for (let i = 0; i < count; i++) {
+        if (elemSchema.base === 'Integer') {
+            view.setInt32(listDataPtr + i * elemSize, (records[i] | 0) || 0, true);
+        } else if (elemSchema.base === 'Bool') {
+            view.setInt32(listDataPtr + i * elemSize, records[i] ? 1 : 0, true);
+        } else if (elemSchema.fields) {
+            writeStructFromJsonRecord(
+                view,
+                listDataPtr + i * elemSize,
+                elemSchema,
+                jsonText,
+                records[i]
+            );
+        } else {
+            throw new Error(`unsupported read_file list element type ${elemSchema.base}`);
+        }
+    }
+    return count;
+}
+
+function writeReadFileInputString(view, allocate, schema, content, outPtr) {
+    const maxLen = schema.inner.max_len;
+    const finalLen = Math.min(content.length, maxLen);
+    const mem = new Uint8Array(view.buffer);
+    mem[outPtr] = 0;
+    const out_string_ptr = allocate(8);
+    const out_list_ptr = allocate(4);
+    const out_char_data_ptr = allocate(maxLen * 4);
+    view.setInt32(outPtr + 1, out_string_ptr, true);
+    view.setInt32(out_string_ptr, finalLen, true);
+    view.setInt32(out_string_ptr + 4, out_list_ptr, true);
+    view.setInt32(out_list_ptr, out_char_data_ptr, true);
+    for (let i = 0; i < finalLen; i++) {
+        view.setInt32(out_char_data_ptr + i * 4, content.codePointAt(i), true);
+    }
+}
+
+function readPathString(view, path_ptr, path_len) {
+    const list_ptr = view.getInt32(path_ptr + 4, true);
+    const char_data_ptr = view.getInt32(list_ptr, true);
+    let path = "";
+    for (let i = 0; i < path_len; i++) {
+        path += String.fromCodePoint(view.getInt32(char_data_ptr + i * 4, true));
+    }
+    return path;
+}
+
+// main() parameters are all Input[T]. Each CLI argument is parsed into its inner
+// type T: a valid argument becomes Some(value), an invalid one becomes None. The
+// count of arguments must still match (a usage error), but a present-but-invalid
+// argument is surfaced to the program as None rather than aborting.
 function validateMainArgs(rawArgs, metadata) {
     if (!metadata || !metadata.main) {
-        return rawArgs.map(Number);
+        return [];
     }
 
     const params = metadata.main.params || [];
-    if (rawArgs.length !== params.length) {
-        const expected = params.length === 0
+    const inputArgs = metadata.main.input_args || [];
+
+    if (rawArgs.length !== inputArgs.length) {
+        const expected = inputArgs.length === 0
             ? 'no arguments'
-            : `${params.length} argument(s): ${params.map((p) => `${p.name}: ${p.type}`).join(', ')}`;
+            : `${inputArgs.length} argument(s): ${params.map((p) => `${p.name}: ${p.type}`).join(', ')}`;
         const got = rawArgs.length === 0 ? 'no arguments' : `${rawArgs.length} argument(s)`;
         throw new Error(
             `main expects ${expected}, but received ${got}.` +
@@ -219,24 +523,15 @@ function validateMainArgs(rawArgs, metadata) {
         );
     }
 
-    const parsed = [];
-    for (let i = 0; i < params.length; i++) {
-        const param = params[i];
-        const raw = rawArgs[i];
-        const value = Number(raw);
-        if (raw === '' || !Number.isFinite(value) || !Number.isInteger(value)) {
-            throw new Error(
-                `Argument '${param.name}' must be of type ${param.type}, but got '${raw}'.`
-            );
+    return inputArgs.map((spec, i) => {
+        let parsed = null;
+        try {
+            parsed = parseInputValue(spec, rawArgs[i]);
+        } catch (e) {
+            parsed = null; // invalid argument -> None
         }
-        if (!constraintSatisfied(param, value)) {
-            throw new Error(
-                `Argument '${param.name}' must satisfy type ${param.type}, but got ${value}.`
-            );
-        }
-        parsed.push(value);
-    }
-    return parsed;
+        return { spec, parsed };
+    });
 }
 
 (async () => {
@@ -265,9 +560,20 @@ function validateMainArgs(rawArgs, metadata) {
 
     let exports;
     let heapPtr = 50000; // Safe start of temp heap for runtime allocations
+    let view = null;
+    function refreshView() {
+        view = new DataView(exports.memory.buffer);
+        return view;
+    }
     function allocate(size) {
+        let mem = new Uint8Array(exports.memory.buffer);
+        if (heapPtr + size > mem.length) {
+            const pagesNeeded = Math.ceil((heapPtr + size - mem.length) / 65536);
+            exports.memory.grow(pagesNeeded);
+        }
         const addr = heapPtr;
         heapPtr += size;
+        refreshView();
         return addr;
     }
 
@@ -346,14 +652,54 @@ function validateMainArgs(rawArgs, metadata) {
                     view.setInt32(char_data_ptr + i * 4, line.codePointAt(i), true);
                 }
             },
+            read_file_typed_raw: function(call_id, path_ptr, path_len, out_ptr) {
+                refreshView();
+                let mem = new Uint8Array(exports.memory.buffer);
+                const schema = mainMetadata && mainMetadata.read_file_calls
+                    ? mainMetadata.read_file_calls.find((c) => c.id === call_id)
+                    : null;
+                if (!schema) {
+                    throw new Error(`unknown read_file call id ${call_id}`);
+                }
+                if (schema.base !== 'Input' || !schema.inner) {
+                    throw new Error(`read_file at line ${schema.line}: expected Input[T] annotation`);
+                }
+                const path = readPathString(view, path_ptr, path_len);
+                try {
+                    if (!fs.existsSync(path)) {
+                        mem[out_ptr] = 1;
+                        return;
+                    }
+                    const content = fs.readFileSync(path, 'utf8');
+                    writeTypedJsonInput(view, allocate, schema.inner, content, out_ptr);
+                } catch (e) {
+                    mem[out_ptr] = 1;
+                }
+            },
+            http_get_typed_raw: function(call_id, url_ptr, url_len, out_ptr) {
+                refreshView();
+                let mem = new Uint8Array(exports.memory.buffer);
+                const view = new DataView(exports.memory.buffer);
+                const schema = mainMetadata && mainMetadata.http_get_calls
+                    ? mainMetadata.http_get_calls.find((c) => c.id === call_id)
+                    : null;
+                if (!schema) {
+                    throw new Error(`unknown http_get call id ${call_id}`);
+                }
+                if (schema.base !== 'Input' || !schema.inner) {
+                    throw new Error(`http_get at line ${schema.line}: expected Input[T] annotation`);
+                }
+                const url = readPathString(view, url_ptr, url_len);
+                try {
+                    const content = cp.execFileSync('curl', ['-s', '--max-time', '5', url], { encoding: 'utf8' });
+                    writeTypedJsonInput(view, allocate, schema.inner, content, out_ptr);
+                } catch (e) {
+                    mem[out_ptr] = 1;
+                }
+            },
             read_file_raw: function(path_ptr, path_len, out_ptr, max_len) {
                 const view = new DataView(exports.memory.buffer);
-                const list_ptr = view.getInt32(path_ptr + 4, true);
-                const char_data_ptr = view.getInt32(list_ptr, true);
-                let path = "";
-                for (let i = 0; i < path_len; i++) {
-                    path += String.fromCodePoint(view.getInt32(char_data_ptr + i * 4, true));
-                }
+                const path = readPathString(view, path_ptr, path_len);
                 const mem = new Uint8Array(exports.memory.buffer);
                 try {
                     if (!fs.existsSync(path)) {
@@ -361,29 +707,13 @@ function validateMainArgs(rawArgs, metadata) {
                         return;
                     }
                     const content = fs.readFileSync(path, 'utf8');
-                    const finalLen = Math.min(content.length, max_len);
-                    
-                    // Write Union tag (Some = 0)
-                    mem[out_ptr] = 0;
-                    
-                    // Allocate String struct, List struct, and characters
-                    const out_string_ptr = allocate(8);
-                    const out_list_ptr = allocate(4);
-                    const out_char_data_ptr = allocate(max_len * 4);
-                    
-                    // Write String pointer to Some variant Value field
-                    view.setInt32(out_ptr + 1, out_string_ptr, true);
-                    // Write len to String len field
-                    view.setInt32(out_string_ptr, finalLen, true);
-                    // Write List pointer to String data field
-                    view.setInt32(out_string_ptr + 4, out_list_ptr, true);
-                    // Write Group pointer to List data field
-                    view.setInt32(out_list_ptr, out_char_data_ptr, true);
-                    
-                    // Write character code points
-                    for (let i = 0; i < finalLen; i++) {
-                        view.setInt32(out_char_data_ptr + i * 4, content.codePointAt(i), true);
-                    }
+                    writeReadFileInputString(
+                        view,
+                        allocate,
+                        { inner: { base: 'String', max_len } },
+                        content,
+                        out_ptr
+                    );
                 } catch (e) {
                     mem[out_ptr] = 1; // None (tag 1)
                 }
@@ -436,6 +766,7 @@ function validateMainArgs(rawArgs, metadata) {
                 if (!schema) {
                     throw new Error(`unknown input call id ${call_id}`);
                 }
+                const innerSchema = schema.base === 'Input' ? schema.inner : schema;
                 const prompt = readStringStruct(view, prompt_ptr);
                 for (;;) {
                     process.stdout.write(prompt);
@@ -443,16 +774,37 @@ function validateMainArgs(rawArgs, metadata) {
                     try {
                         line = readStdinLine(fs);
                     } catch (e) {
-                        throw new Error(`input at line ${schema.line}: ${e.message || e}`);
+                        const mem = new Uint8Array(exports.memory.buffer);
+                        mem[out_ptr] = 1;
+                        return;
                     }
                     try {
-                        const parsed = parseInputValue(schema, line);
-                        writeInputValue(view, allocate, out_ptr, parsed);
+                        const parsed = parseInputValue(innerSchema, line);
+                        writeInputSome(view, allocate, out_ptr, innerSchema, parsed);
                         return;
                     } catch (e) {
                         process.stderr.write(`${e.message || e}\n`);
                     }
                 }
+            },
+            parse_users_from_json_raw: function(json_ptr, list_ptr, max_users) {
+                const view = new DataView(exports.memory.buffer);
+                const jsonText = readStringStruct(view, json_ptr);
+                let records;
+                try {
+                    records = JSON.parse(jsonText);
+                } catch (e) {
+                    return 0;
+                }
+                if (!Array.isArray(records)) {
+                    return 0;
+                }
+                const listDataPtr = list_ptr;
+                const count = Math.min(records.length, max_users);
+                for (let i = 0; i < count; i++) {
+                    writeUserRecord(view, listDataPtr + i * USER_RECORD_SIZE, jsonText, records[i]);
+                }
+                return count;
             },
             concat_strings: function(out_ptr, a_ptr, b_ptr, max_out) {
                 const view = new DataView(exports.memory.buffer);
@@ -478,6 +830,22 @@ function validateMainArgs(rawArgs, metadata) {
                     view.setInt32(out_char_ptr + (a_len + i) * 4, view.getInt32(b_chars + i * 4, true), true);
                 }
             },
+            join_strings_raw: function(out_ptr, handle_ptr, sep_ptr, max_out) {
+                const view = new DataView(exports.memory.buffer);
+                // handle: [count][strptr_0]...[strptr_{n-1}]
+                const count = view.getInt32(handle_ptr, true);
+                const sep = readStringStruct(view, sep_ptr);
+                const parts = [];
+                for (let i = 0; i < count; i++) {
+                    const strPtr = view.getInt32(handle_ptr + 4 + i * 4, true);
+                    parts.push(readStringStruct(view, strPtr));
+                }
+                const result = parts.join(sep);
+                if (result.length > max_out) {
+                    throw new Error(`join result length ${result.length} exceeds capacity ${max_out}`);
+                }
+                writeStringValue(refreshView(), allocate, out_ptr, result, max_out);
+            },
             strings_equal: function(a_ptr, b_ptr) {
                 const view = new DataView(exports.memory.buffer);
                 const a_len = view.getInt32(a_ptr, true);
@@ -495,6 +863,20 @@ function validateMainArgs(rawArgs, metadata) {
                     }
                 }
                 return 1;
+            },
+            rational_to_string_raw: function(r_ptr, out_ptr, max_len) {
+                refreshView();
+                const view = new DataView(exports.memory.buffer);
+                const num = view.getInt32(r_ptr, true);
+                const den = view.getInt32(r_ptr + 4, true);
+                const value = den === 0 ? 0 : num / den;
+                const text = String(value);
+                writeStringValue(view, allocate, out_ptr, text, max_len);
+            },
+            integer_to_string_raw: function(val, out_ptr, max_len) {
+                refreshView();
+                const view = new DataView(exports.memory.buffer);
+                writeStringValue(view, allocate, out_ptr, String(val), max_len);
             }
         }
     };
@@ -502,6 +884,7 @@ function validateMainArgs(rawArgs, metadata) {
     try {
         const result = await WebAssembly.instantiate(wasmBuffer, imports);
         exports = result.instance.exports;
+        refreshView();
     } catch (err) {
         console.error("WebAssembly Instantiation Failed:", err);
         process.exit(1);
@@ -511,7 +894,14 @@ function validateMainArgs(rawArgs, metadata) {
         if (exports.main) {
             const rawArgs = process.argv.slice(3);
             const args = validateMainArgs(rawArgs, mainMetadata);
-            const ret = exports.main(...args);
+            for (const { spec, parsed } of args) {
+                if (parsed === null) {
+                    new Uint8Array(exports.memory.buffer)[spec.addr] = 1; // None
+                } else {
+                    writeInputSome(refreshView(), allocate, spec.addr, spec, parsed);
+                }
+            }
+            const ret = exports.main();
             if (ret !== undefined) {
                 console.log(ret);
             }
