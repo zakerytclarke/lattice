@@ -127,8 +127,6 @@ class StringResolvedType(ResolvedType):
         # max_len chars + 4 bytes for current length field
         return (self.max_len * 4) + 4
 
-DEFAULT_STRING_CAPACITY = 64
-
 class StaticMapResolvedType(ResolvedType):
     def __init__(self, value_type, entries):
         self.name = "StaticMap"
@@ -330,15 +328,16 @@ class Resolver:
         
         name = te.name
         if name == 'String' and te.size is None and not te.args:
-            te = TypeExpr(
-                'String',
-                [],
+            raise LatticeTypeError(
+                "Cannot infer the size of this String — every String needs a known capacity.",
                 te.line,
-                getattr(te, 'constraint', None),
-                getattr(te, 'constraint_var', None),
-                Literal(DEFAULT_STRING_CAPACITY, 'Integer', te.line),
+                hint=(
+                    "Give an explicit size, e.g. String(32) or Input[String(32)]. String "
+                    "sizes are only inferred from the types of values (string literals, "
+                    "concatenation, struct fields) — never from external/CLI input, whose "
+                    "length is unknown at compile time."
+                ),
             )
-            name = 'String'
         # Substitute generic parameters if they are in the generic map
         if name in generic_map:
             val = generic_map[name]
@@ -1605,22 +1604,74 @@ class Resolver:
                         "or List[Integer] with inferred length. " + static_memory_hint()
                     ),
                 )
-            first_t = self.infer_expr_type(expr.elements[0], generic_map)
-            for i, el in enumerate(expr.elements[1:], start=1):
-                elt = self.infer_expr_type(el, generic_map)
-                if elt.name != first_t.name:
-                    raise LatticeTypeError(
-                        f"List elements must have the same type: expected {format_type(first_t)}, "
-                        f"got {format_type(elt)} at position {i + 1}",
-                        expr.line,
+            elem_types = [self.infer_expr_type(el, generic_map) for el in expr.elements]
+
+            # Special-case: lists of string literals.
+            # String literals monomorphize into StructResolvedType instances like
+            # String_5 / String_3 / ...
+            # We can infer a safe capacity by widening to the maximum literal
+            # length, then padding shorter literals.
+            if elem_types:
+                elem_max_lens = []
+                for t in elem_types:
+                    if isinstance(t, StringResolvedType):
+                        elem_max_lens.append(t.max_len)
+                    else:
+                        elem_max_lens.append(self._struct_string_max_len(t))
+
+                if all(m is not None for m in elem_max_lens):
+                    max_len = max(elem_max_lens)
+                    unified_elem_t = self.resolve_type_expr(
+                        TypeExpr(
+                            'String',
+                            [],
+                            expr.line,
+                            size=Literal(max_len, 'Integer', expr.line),
+                        ),
+                        generic_map,
                     )
-            list_te = TypeExpr(
-                'List',
-                [TypeExpr(first_t.name, [], expr.line)],
-                expr.line,
-                size=Literal(len(expr.elements), 'Integer', expr.line),
-            )
-            return self.resolve_type_expr(list_te, generic_map)
+                    for i, el in enumerate(expr.elements):
+                        if isinstance(el, StringLiteral):
+                            expr.elements[i] = lower_string_literal(el, max_len)
+                    first_t = unified_elem_t
+                else:
+                    first_t = elem_types[0]
+                    for i, el_type in enumerate(elem_types[1:], start=1):
+                        if repr(el_type) != repr(first_t):
+                            raise LatticeTypeError(
+                                f"List elements must have the same type: expected {format_type(first_t)}, "
+                                f"got {format_type(el_type)} at position {i + 1}",
+                                expr.line,
+                            )
+            else:
+                first_t = elem_types[0]
+                for i, el_type in enumerate(elem_types[1:], start=1):
+                    # Compare structurally so nested lists/strings/structs work, not
+                    # just simple named primitives.
+                    if repr(el_type) != repr(first_t):
+                        raise LatticeTypeError(
+                            f"List elements must have the same type: expected {format_type(first_t)}, "
+                            f"got {format_type(el_type)} at position {i + 1}",
+                            expr.line,
+                        )
+            # The element size is inferred fine, but a List is stored as a handle to
+            # its data, and the code generator can't yet nest that indirection inside
+            # another List's inline storage. Fail clearly instead of silently
+            # producing garbage.
+            if isinstance(first_t, (ListResolvedType, MaterializedListResolvedType)):
+                raise LatticeTypeError(
+                    "Nested list literals (a List whose elements are themselves Lists) "
+                    "are not supported.",
+                    expr.line,
+                    hint=(
+                        "The size of "
+                        f"{format_type(ListResolvedType(len(expr.elements), first_t))} "
+                        "is fully inferred, but 2D storage isn't lowered yet. Model rows "
+                        "with a struct instead, e.g. `type Row(a: Integer, b: Integer)` "
+                        "then `List([Row(1, 2), Row(3, 4)])`."
+                    ),
+                )
+            return ListResolvedType(len(expr.elements), first_t)
 
         if isinstance(expr, IndexExpr):
             arr_t = self.infer_expr_type(expr.expr, generic_map)
@@ -2130,7 +2181,36 @@ class Resolver:
                 bound_value_t = raw_value_t.inner
             else:
                 bound_value_t = raw_value_t
-            t = self.resolve_type_expr(stmt.type_expr) if stmt.type_expr else bound_value_t
+            if stmt.type_expr:
+                try:
+                    t = self.resolve_type_expr(stmt.type_expr)
+                except LatticeTypeError:
+                    # For local bindings, permit a bare `String` annotation when the
+                    # initializer fully determines the capacity (string literals
+                    # and concatenations).
+                    #
+                    # We still reject `Input[String]` (external/CLI-bound strings)
+                    # because that size cannot be derived at compile time.
+                    te = stmt.type_expr
+                    is_bare_string = (
+                        getattr(te, "name", None) == "String"
+                        and getattr(te, "size", None) is None
+                        and not getattr(te, "args", None)
+                    )
+                    is_sized_string_val = (
+                        isinstance(bound_value_t, StringResolvedType)
+                        and bound_value_t.max_len is not None
+                        or (
+                            isinstance(bound_value_t, StructResolvedType)
+                            and self._struct_string_max_len(bound_value_t) is not None
+                        )
+                    )
+                    if is_bare_string and is_sized_string_val:
+                        t = bound_value_t
+                    else:
+                        raise
+            else:
+                t = bound_value_t
             if not stmt.type_expr and self.current_func:
                 self.inferred_bindings[self.current_func.name].add(stmt.name)
             if stmt.type_expr:

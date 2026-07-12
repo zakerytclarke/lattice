@@ -1,0 +1,34 @@
+// Just like String, the size of a List (and the Group of memory it holds) is
+// inferred from the types of the values that flow into it — never guessed. A
+// list literal has as many slots as it has elements, and each slot is as big as
+// the element type. Nothing below is annotated with a size; every capacity is
+// recovered by the type system.
+
+// A struct groups a fixed set of fields, so its size is always known. Using a
+// struct as the element type lets us build table-like data whose row size is
+// inferred.
+type Point(x: Integer, y: Integer)
+
+external function main() {
+    // Size inferred from the literal: 3 elements of Integer -> List(3)[Integer]
+    // (a Group(3)[Integer] of 12 bytes of storage).
+    let primes = List([2, 3, 5]);
+    print(primes.data[0]);   // 2
+    print(primes.data[2]);   // 5
+    print("\n");
+
+    // You may still write the size explicitly; it just has to agree with what
+    // the literal implies. Here List(4)[Integer] matches the 4 elements.
+    let squares: List(4)[Integer] = List([1, 4, 9, 16]);
+    print(squares.data[3]);  // 16
+    print("\n");
+
+    // A list of structs: element size = Point (two Integers = 8 bytes), count =
+    // 2, so the whole thing is inferred as List(2)[Point] (a 16-byte Group).
+    let corners = List([Point(0, 0), Point(10, 20)]);
+    print(corners.data[1].x); // 10
+    print(corners.data[1].y); // 20
+    print("\n");
+
+    return 0;
+}

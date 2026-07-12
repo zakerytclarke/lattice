@@ -1,0 +1,37 @@
+// Ackermann function. Each recursive call decreases either m or n under the
+// non-negative preconditions, which Lattice can prove terminates. The return
+// type is declared so the nested call's result can be typed; parameters are
+// otherwise inferred.
+//
+// Grows extremely quickly — try small inputs (e.g. 2 3 → 9, 3 2 → 29).
+function ackermann(m, n) -> Integer {
+    m >= 0 && n >= 0;
+} {
+    if (m == 0) {
+        return n + 1;
+    } else {
+        if (n == 0) {
+            return ackermann(m - 1, 1);
+        } else {
+            return ackermann(m - 1, ackermann(m, n - 1));
+        }
+    }
+}
+
+external function main(m_arg: Input[Integer], n_arg: Input[Integer]) {
+    match (m_arg) {
+        Some(m) => {
+            match (n_arg) {
+                Some(n) => {
+                    if (m < 0 || n < 0) {
+                        return 0;
+                    } else {
+                        return ackermann(m, n);
+                    }
+                }
+                None => { return 0; }
+            }
+        }
+        None => { return 0; }
+    }
+}

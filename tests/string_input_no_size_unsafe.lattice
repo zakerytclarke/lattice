@@ -1,0 +1,15 @@
+// A CLI String with no declared size cannot compile: the compiler has no way to
+// infer how long external input will be, and `n` is only printed (never bounded
+// by a comparison to a known string), so there is nothing to infer a size from.
+external function main(name: Input[String]) {
+    match (name) {
+        Some(n) => {
+            print("Hi ");
+            print(n);
+        }
+        None => {
+            print("no name");
+        }
+    }
+    return 0;
+}

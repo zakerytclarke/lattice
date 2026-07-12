@@ -1,0 +1,15 @@
+external function main(idx_arg: Input[Integer]) {
+    let names = ["Alice", "Bob", "Charlie"];
+    match (idx_arg) {
+        Some(idx) => {
+            if (idx >= 0 && idx < 3) {
+                let greeting = "Hello, " + names[idx];
+                println(greeting);
+            }
+            return 0;
+        }
+        None => {
+            return 0;
+        }
+    }
+}

@@ -293,12 +293,8 @@ class WASMEmitter:
         code = bytearray()
         self.current_compiling_func = func.name
         self.current_compiling_func_decl = func
-        use_tail_loop = self._function_has_tail_calls(func)
-        
-        if use_tail_loop:
-            # Tail-call loop: self-recursive tail calls branch here instead of growing the stack.
-            code.append(0x03) # loop
-            code.append(0x40) # void
+        # Tail-call-to-loop rewriting is disabled until branch-depth tracking is
+        # fixed; emit ordinary recursive calls instead.
         
         # main() parameters are Input[T] values written into static memory by the
         # runtime; any refinement on the inner type is enforced during parsing
@@ -316,13 +312,8 @@ class WASMEmitter:
         if has_ret:
             code.append(0x41) # i32.const
             code.extend(encode_sleb128(0))
-            if use_tail_loop:
-                code.append(0x0f) # return
             
-        if use_tail_loop:
-            code.append(0x0b) # end tail-call loop
-        else:
-            code.append(0x0b) # end function body expression
+        code.append(0x0b) # end function body expression
         self.current_compiling_func = None
         self.current_compiling_func_decl = None
         self.resolver.current_generic_map = {}
@@ -342,9 +333,15 @@ class WASMEmitter:
             self._list_pad_to = None
             self._list_elem_type = None
             if stmt.type_expr:
-                declared = self.resolver.resolve_type_expr(
-                    stmt.type_expr, self.resolver.current_generic_map
-                )
+                declared = None
+                try:
+                    declared = self.resolver.resolve_type_expr(
+                        stmt.type_expr, self.resolver.current_generic_map
+                    )
+                except LatticeTypeError:
+                    # A bare `String` can be valid for locals because the resolver
+                    # may infer its capacity from the initializer.
+                    declared = None
                 if isinstance(declared, ListResolvedType) and declared.length is not None:
                     self._list_pad_to = declared.length
                     self._list_elem_type = declared.elem_type
@@ -532,23 +529,9 @@ class WASMEmitter:
                 code.append(0x0b) # end if
                 
         elif isinstance(stmt, ReturnStmt):
-            if stmt.expr and self._is_tail_call(stmt.expr):
-                resolution = self.resolver.resolved_calls.get(id(stmt.expr))
-                callee = (
-                    resolution["decl"]
-                    if resolution
-                    else self.current_compiling_func_decl
-                )
-                for i, arg in enumerate(stmt.expr.args):
-                    code.extend(self.compile_expr(arg))
-                    code.append(0x21) # local.set
-                    code.extend(encode_leb128(self.wasm_locals[callee.params[i].name]))
-                code.append(0x0c) # br 0 (tail-call loop)
-                code.extend(encode_leb128(0))
-            else:
-                if stmt.expr:
-                    code.extend(self.compile_expr(stmt.expr))
-                code.append(0x0f) # WASM explicit return instruction
+            if stmt.expr:
+                code.extend(self.compile_expr(stmt.expr))
+            code.append(0x0f) # WASM explicit return instruction
             
         elif isinstance(stmt, ExprStmt):
             code.extend(self.compile_expr(stmt.expr))
@@ -704,6 +687,73 @@ class WASMEmitter:
             blob += c.to_bytes(4, 'little', signed=True)
         return self._emit_data_blob(blob)
 
+    def _extract_string_chars(self, expr):
+        """Return (length, char_codes, capacity) from a compile-time string value."""
+        if isinstance(expr, StringLiteral):
+            codes = [ord(c) for c in expr.value]
+            return len(codes), codes, len(codes)
+        if isinstance(expr, CallExpr) and isinstance(expr.func, Identifier) and expr.func.name == 'String':
+            if not expr.args:
+                return 0, [], 0
+            len_arg = expr.args[0]
+            if not (isinstance(len_arg, Literal) and len_arg.val_type == 'Integer'):
+                return None
+            length = len_arg.value
+            cap = None
+            if expr.generic_args:
+                cap_arg = expr.generic_args[0]
+                if isinstance(cap_arg, Literal) and cap_arg.val_type == 'Integer':
+                    cap = cap_arg.value
+            list_arg = expr.args[1] if len(expr.args) > 1 else None
+            codes = []
+            if (
+                isinstance(list_arg, CallExpr)
+                and isinstance(list_arg.func, Identifier)
+                and list_arg.func.name == 'List'
+                and list_arg.args
+                and isinstance(list_arg.args[0], ListLiteral)
+            ):
+                for ch in list_arg.args[0].elements:
+                    if isinstance(ch, Literal) and ch.val_type == 'Char':
+                        val = ch.value
+                        codes.append(ord(val) if isinstance(val, str) else int(val))
+            if cap is None:
+                cap = max(length, len(codes))
+            return length, codes, cap
+        return None
+
+    def _heap_string_slot_bytes(self, expr, slot_addr, slot_size):
+        """Serialize a String into a fixed-size list slot using pointer layout.
+
+        Layout in the slot (matches runtime String + List indirection):
+          [len][list_ptr -> slot+8][char_ptr -> char_data_blob]
+        Character data is stored in a separate data-segment blob.
+        """
+        extracted = self._extract_string_chars(expr)
+        if extracted is None:
+            return self._compile_time_serialize(expr).ljust(slot_size, b'\x00')[:slot_size]
+        length, codes, capacity = extracted
+        char_addr = self.data_offset
+        char_blob = bytearray()
+        for c in codes:
+            char_blob += c.to_bytes(4, 'little', signed=True)
+        while len(char_blob) < capacity * 4:
+            char_blob += b'\x00' * 4
+        self.data_section.append(
+            b'\x00\x41' + encode_sleb128(char_addr) + b'\x0b'
+            + encode_leb128(len(char_blob)) + bytes(char_blob)
+        )
+        self.data_offset += len(char_blob)
+
+        list_wrapper_addr = slot_addr + 8
+        slot_blob = bytearray()
+        slot_blob += length.to_bytes(4, 'little', signed=True)
+        slot_blob += list_wrapper_addr.to_bytes(4, 'little', signed=True)
+        slot_blob += char_addr.to_bytes(4, 'little', signed=True)
+        if len(slot_blob) < slot_size:
+            slot_blob += b'\x00' * (slot_size - len(slot_blob))
+        return bytes(slot_blob[:slot_size])
+
     def _emit_value_pointer(self, value_type, val_expr):
         if (
             self.resolver._struct_string_max_len(value_type) is not None
@@ -752,6 +802,21 @@ class WASMEmitter:
                         blob.extend(arg_bytes)
                     else:
                         blob.extend(self._compile_time_serialize(arg))
+                return bytes(blob)
+        if isinstance(expr, ListLiteral):
+            list_t = self.resolver.infer_expr_type(expr)
+            if isinstance(list_t, ListResolvedType) and list_t.elem_type is not None:
+                elem_size = list_t.elem_type.get_size(self.resolver)
+                blob = bytearray()
+                for el in expr.elements:
+                    el_bytes = self._compile_time_serialize(el)
+                    if len(el_bytes) < elem_size:
+                        el_bytes = el_bytes + b'\x00' * (elem_size - len(el_bytes))
+                    elif len(el_bytes) > elem_size:
+                        el_bytes = el_bytes[:elem_size]
+                    blob.extend(el_bytes)
+                if list_t.length is not None and list_t.length > len(expr.elements):
+                    blob.extend(b'\x00' * (elem_size * (list_t.length - len(expr.elements))))
                 return bytes(blob)
         if isinstance(expr, StructLiteral):
             blob = bytearray()
@@ -1004,6 +1069,7 @@ class WASMEmitter:
             # Calculate address = base_address + index * element_size
             arr_t = self.resolver.infer_expr_type(expr.expr)
             elem_size = arr_t.elem_type.get_size(self.resolver)
+            elem_is_primitive = isinstance(arr_t.elem_type, PrimitiveResolvedType)
             
             code.extend(self.compile_expr(expr.expr))
             code.extend(self.compile_expr(expr.index))
@@ -1012,9 +1078,13 @@ class WASMEmitter:
             code.append(0x6c) # i32.mul
             code.append(0x6a) # i32.add
             
-            # Load from address: i32.load
-            code.append(0x28)
-            code.extend(b'\x02\x00') # alignment 2, offset 0
+            # For primitive element types (Integer/Bool/Char), load the value.
+            # For struct-like element types (e.g. String, Rational), return
+            # the element address so downstream code (field access / print)
+            # can read the full struct from memory.
+            if elem_is_primitive:
+                code.append(0x28) # i32.load
+                code.extend(b'\x02\x00') # alignment 2, offset 0
             
         elif isinstance(expr, FieldExpr):
             field_t = self.resolver.infer_expr_type(expr)
@@ -1214,25 +1284,41 @@ class WASMEmitter:
             
         elif isinstance(expr, ListLiteral):
             # Allocate list statically in data section and return memory offset
-            addr = self.data_offset
-            data_bytes = bytearray()
-            for el in expr.elements:
-                data_bytes.extend(self._compile_time_serialize(el))
+            list_t = self.resolver.infer_expr_type(expr)
+            elem_size = None
+            string_elem = False
+            if isinstance(list_t, ListResolvedType) and list_t.elem_type is not None:
+                elem_size = list_t.elem_type.get_size(self.resolver)
+                string_elem = self.resolver._struct_string_max_len(list_t.elem_type) is not None
+
+            pad_count = 0
             if self._list_pad_to is not None and self._list_elem_type is not None:
+                pad_count = max(0, self._list_pad_to - len(expr.elements))
                 elem_size = self._list_elem_type.get_size(self.resolver)
-                pad_count = self._list_pad_to - len(expr.elements)
-                if pad_count > 0:
-                    data_bytes.extend(b'\x00' * (pad_count * elem_size))
-                    
+
+            list_addr = self.data_offset
+            slot_count = len(expr.elements) + pad_count
+            list_byte_len = slot_count * (elem_size or 4)
+            self.data_offset += list_byte_len
+
+            data_bytes = bytearray()
+            for i, el in enumerate(expr.elements):
+                slot_addr = list_addr + i * elem_size
+                if string_elem and elem_size is not None:
+                    data_bytes.extend(self._heap_string_slot_bytes(el, slot_addr, elem_size))
+                else:
+                    data_bytes.extend(self._compile_time_serialize(el))
+            if pad_count > 0:
+                data_bytes.extend(b'\x00' * (pad_count * elem_size))
+
             # Register data segment
             self.data_section.append(
-                b'\x00\x41' + encode_sleb128(addr) + b'\x0b' + encode_leb128(len(data_bytes)) + bytes(data_bytes)
+                b'\x00\x41' + encode_sleb128(list_addr) + b'\x0b' + encode_leb128(len(data_bytes)) + bytes(data_bytes)
             )
-            self.data_offset += len(data_bytes)
-            
+
             # Return address on WASM stack
             code.append(0x41)
-            code.extend(encode_sleb128(addr))
+            code.extend(encode_sleb128(list_addr))
             
         return code
 

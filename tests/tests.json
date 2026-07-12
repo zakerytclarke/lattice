@@ -245,5 +245,105 @@
         "expected_range": [-40, 50]
       }
     ]
+  },
+  {
+    "file": "string_index_example.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [0],
+        "expected": "Hello, Alice\n0"
+      },
+      {
+        "args": [1],
+        "expected": "Hello, Bob\n0"
+      },
+      {
+        "args": [2],
+        "expected": "Hello, Charlie\n0"
+      }
+    ]
+  },
+  {
+    "file": "gcd.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [48, 18],
+        "expected": 6
+      },
+      {
+        "args": [17, 5],
+        "expected": 1
+      }
+    ]
+  },
+  {
+    "file": "ackermann.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [2, 3],
+        "expected": 9
+      },
+      {
+        "args": [3, 2],
+        "expected": 29
+      }
+    ]
+  },
+  {
+    "file": "binary_search.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [7],
+        "expected": 3
+      },
+      {
+        "args": [1],
+        "expected": 0
+      },
+      {
+        "args": [4],
+        "expected": -1
+      },
+      {
+        "args": [15],
+        "expected": 7
+      }
+    ]
+  },
+  {
+    "file": "collatz.lattice",
+    "should_fail": true
+  },
+  {
+    "file": "cli_command.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": ["start"],
+        "expected": "Starting up...\\n0"
+      },
+      {
+        "args": ["stop"],
+        "expected": "Shutting down...\\n0"
+      },
+      {
+        "args": ["status"],
+        "expected": "Unknown command\\n0"
+      }
+    ]
+  },
+  {
+    "file": "list_sizes.lattice",
+    "should_fail": false,
+    "test_cases": [
+      {
+        "args": [],
+        "expected": "25\\n16\\n1020\\n0"
+      }
+    ]
   }
 ]

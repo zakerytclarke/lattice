@@ -1,0 +1,13 @@
+// A List coming from the CLI has no size the compiler can infer: external input
+// length is unknown at compile time, and Lattice has no heap. Without a declared
+// capacity the list's Group would have unknown size, so this must not compile.
+external function main(items: Input[List[Integer]]) {
+    match (items) {
+        Some(xs) => {
+            return xs.data[0];
+        }
+        None => {
+            return 0;
+        }
+    }
+}

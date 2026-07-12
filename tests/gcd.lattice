@@ -1,0 +1,30 @@
+// Euclidean algorithm. Non-negative preconditions are enough for the
+// verifier to prove that a % b < b, so recursion on the second argument
+// terminates — parameters and the return type are inferred.
+function gcd(a, b) {
+    a >= 0 && b >= 0;
+} {
+    if (b == 0) {
+        return a;
+    } else {
+        return gcd(b, a % b);
+    }
+}
+
+external function main(a_arg: Input[Integer], b_arg: Input[Integer]) {
+    match (a_arg) {
+        Some(a) => {
+            match (b_arg) {
+                Some(b) => {
+                    if (a < 0 || b < 0) {
+                        return 0;
+                    } else {
+                        return gcd(a, b);
+                    }
+                }
+                None => { return 0; }
+            }
+        }
+        None => { return 0; }
+    }
+}

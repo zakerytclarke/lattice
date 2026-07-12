@@ -1,0 +1,8 @@
+// The size of a list-of-lists is perfectly inferable (2 rows of List(2)[Integer]),
+// but a List is stored as a handle to its data and the code generator can't nest
+// that indirection inside another List's inline storage yet. This should fail
+// with a clear error rather than silently producing garbage.
+external function main() {
+    let grid = List([List([1, 2]), List([3, 4])]);
+    return grid.data[0].data[0];
+}

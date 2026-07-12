@@ -12,7 +12,7 @@ type WeatherResponse(
 )
 
 function fetch_weather(latitude: Rational, longitude: Rational) -> IO[Input[WeatherResponse]] {
-    let url: String(256) = "https://api.open-meteo.com/v1/forecast?latitude=" + latitude + "&longitude=" + longitude + "&current=temperature_2m&temperature_unit=fahrenheit";
+    let url: String = "https://api.open-meteo.com/v1/forecast?latitude=" + latitude + "&longitude=" + longitude + "&current=temperature_2m&temperature_unit=fahrenheit";
     let response: Input[WeatherResponse] = http_get(url);
     return response;
 }
@@ -21,7 +21,7 @@ function convert_fahrenheit_to_celsius(degrees_fahrenheit: Integer) -> Integer {
     return (degrees_fahrenheit - 32) * 5 / 9;
 }
 
-external function main(city_arg: Input[String]) {
+external function main(city_arg: Input[String(32)]) {
     let cities = {
         "London": {
             latitude: 51.5,

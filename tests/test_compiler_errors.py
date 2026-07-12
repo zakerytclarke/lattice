@@ -52,6 +52,32 @@ def test_list_unsafe_precondition_message():
     assert "hint:" in out
 
 
+def test_string_input_requires_explicit_size():
+    res = compile_file("string_input_no_size_unsafe.lattice")
+    assert res.returncode != 0
+    out = res.stdout + res.stderr
+    assert "Cannot infer the size of this String" in out
+    assert "hint:" in out
+    assert "String(32)" in out
+
+
+def test_list_input_requires_explicit_size():
+    res = compile_file("list_input_no_size_unsafe.lattice")
+    assert res.returncode != 0
+    out = res.stdout + res.stderr
+    assert "list length is unknown" in out or "index bounds" in out
+    assert "hint:" in out
+    assert "fixed size" in out
+
+
+def test_nested_list_literal_rejected():
+    res = compile_file("nested_list_unsafe.lattice")
+    assert res.returncode != 0
+    out = res.stdout + res.stderr
+    assert "Cannot infer" in out
+    assert "List" in out
+
+
 def test_no_double_safety_error_prefix():
     res = compile_file("list_unsafe.lattice")
     assert res.returncode != 0

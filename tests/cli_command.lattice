@@ -1,0 +1,24 @@
+// A command-line argument is untrusted external input, so its String size can
+// never be inferred — it MUST be declared. Here we accept up to 8 characters
+// and compare the value against known commands. Anything longer than 8 chars
+// can't match any command anyway, so the runtime turns it into None.
+external function main(command: Input[String(8)]) {
+    match (command) {
+        Some(cmd) => {
+            if (cmd == "start") {
+                print("Starting up...");
+            } else {
+                if (cmd == "stop") {
+                    print("Shutting down...");
+                } else {
+                    print("Unknown command");
+                }
+            }
+        }
+        None => {
+            print("No command given (or it was too long).");
+        }
+    }
+    print("\n");
+    return 0;
+}

@@ -405,10 +405,14 @@ The `tests/` directory contains canonical Lattice programs. Start with these:
 | File | Demonstrates |
 |------|--------------|
 | `factorial.lattice` | Recursion with refined types |
+| `gcd.lattice` | Euclidean algorithm; inferred types + preconditions |
+| `ackermann.lattice` | Nested recursion that still proves termination |
+| `binary_search.lattice` | Index safety with an explicit size measure |
+| `collatz.lattice` | Rejected: termination cannot be proved |
 | `arithmetic_safe.lattice` | Refined integers and rationals |
-| `list_safe.lattice` | Fixed lists, preconditions, mutation |
+| `list_safe.lattice` / `list_sizes.lattice` | Fixed lists, preconditions, inferred capacities |
 | `option_safe.lattice` | Union types and exhaustive match |
-| `string_safe.lattice` | Bounded strings |
+| `string_safe.lattice` / `cli_command.lattice` | Bounded strings and CLI string input |
 | `io_safe.lattice` | Printing |
 | `io_advanced_safe.lattice` | File I/O |
 | `import_test_safe.lattice` | Module imports |
